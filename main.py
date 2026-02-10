@@ -112,7 +112,7 @@ async def chat(data: ChatRequest):
 
         return {"respostas": resposta_final, "imagem": img_url, "pix": pix_code}
 
-    # --- MODO IA (Agora com o CARDÁPIO) ---
+    # --- MODO IA (Cardápio) ---
     faltam = []
     if not tem_prod: faltam.append("qual produto deseja")
     if not tem_plano: faltam.append("o plano (Único ou Mensal)")
@@ -122,26 +122,23 @@ async def chat(data: ChatRequest):
     instrucao = f"""
     Você é Mars, vendedor da Rafael Suplementos. Seja persuasivo e curto.
     
-    NOSSO CARDÁPIO (Ofereça isso se o cliente perguntar):
+    NOSSO CARDÁPIO:
     1. Creatina (R$ 97,00) - Essencial para força.
     2. Whey Protein (R$ 149,00) - Recuperação muscular.
     3. BCAA (R$ 79,00) - Energia intra-treino.
     4. Psychotic (R$ 189,00) - Pré-treino potente.
     
-    PLANOS DE DESCONTO:
+    PLANOS:
     - Compra Única (5% OFF)
     - Assinatura Mensal (10% OFF)
     
-    ESTADO ATUAL DA VENDA:
+    ESTADO:
     - Produto: {data.produto_identificado if tem_prod else 'PENDENTE'}
     - Plano: {'OK' if tem_plano else 'PENDENTE'}
     - WhatsApp: {'OK' if tem_whats else 'PENDENTE'}
     - Endereço: {'OK' if tem_local else 'PENDENTE'}
     
-    SUA MISSÃO: 
-    1. Se o cliente perguntar o que vendemos, mostre o cardápio.
-    2. Se ele já escolheu, peça APENAS o que falta da lista: {', '.join(faltam)}.
-    3. Não invente produtos que não estão na lista.
+    Peça APENAS o que falta: {', '.join(faltam)}.
     """
 
     try:
@@ -157,16 +154,55 @@ async def chat(data: ChatRequest):
 
 @app.post("/salvar_lead")
 async def salvar_lead(data: dict):
+    # 1. Recupera os dados crus
+    nome = data.get('nome', 'Cliente')
+    fone = data.get('telefone', '')
+    raw_produto = data.get('produto', '')
+
+    # 2. Organiza a bagunça
+    interesse = raw_produto
+    local_entrega = "Não informado"
+    
+    if " | " in raw_produto:
+        partes = raw_produto.split(" | ")
+        interesse = partes[0] # Pega só a parte do produto
+        for p in partes:
+            if "LOCAL:" in p:
+                local_entrega = p.replace("LOCAL:", "").strip()
+
+    # 3. Cria Link do WhatsApp (Sem traços ou espaços)
+    fone_limpo = fone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    link_zap = f"https://wa.me/55{fone_limpo}" if fone_limpo else ""
+
+    # 4. Mensagem Formatada (Markdown)
+    msg = f"""🔥 *NOVO LEAD MARS*
+    
+👤 *Cliente:* {nome}
+📱 *Zap:* [{fone}]({link_zap})
+
+🛒 *Pedido:* {interesse}
+📍 *Local:* {local_entrega}
+"""
+
+    # 5. Envia para o Telegram
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        msg = f"🚀 LEAD NOVO:\n👤 {data.get('nome')}\n📱 {data.get('telefone')}\n📦 {data.get('produto')}"
         try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "text": msg, 
+                    "parse_mode": "Markdown", 
+                    "disable_web_page_preview": True
+                }
+            )
         except: pass
     
+    # 6. Salva no Supabase
     salvar_no_supabase("leads", {
-        "nome": data.get('nome'), 
-        "telefone": data.get('telefone'), 
-        "info_pedido": data.get('produto')
+        "nome": nome, 
+        "telefone": fone, 
+        "info_pedido": raw_produto
     })
         
     return {"status": "ok"}
