@@ -4,3 +4,4 @@ groq
 requests
 pydantic
 python-dotenv
+mercadopago
