@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-# Tenta carregar variáveis locais (apenas para teste local)
+# Carrega chaves do .env
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -21,18 +21,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CONFIGURAÇÕES E CHAVES ---
+# --- CONFIGURAÇÕES ---
 CHAVE_GROQ = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN") 
-ZAP_ADMIN = "5519999999999" # ⚠️ COLOQUE SEU WHATSAPP AQUI PARA O BOTÃO DE AJUDA
+ZAP_ADMIN = "5519999999999" # ⚠️ SEU WHATSAPP AQUI
 
 client = Groq(api_key=CHAVE_GROQ) if CHAVE_GROQ else None
 
-# --- FUNÇÃO QUE CONECTA NO SUPABASE (BANCO DE DADOS) ---
+# --- CONEXÃO BANCO DE DADOS ---
 def supabase_request(endpoint, method="POST", data=None):
     if not SUPABASE_URL or not SUPABASE_KEY: return None
     headers = {
@@ -51,11 +51,10 @@ def supabase_request(endpoint, method="POST", data=None):
     except: return None
 
 def buscar_produtos_db():
-    # Vai no Supabase e pega a lista de produtos atualizada
     dados = supabase_request("produtos?select=*", method="GET")
     if isinstance(dados, list):
         return dados
-    return [] # Retorna lista vazia se der erro
+    return []
 
 def enviar_telegram(msg):
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
@@ -69,7 +68,7 @@ class ChatRequest(BaseModel):
     preco_base: float = 0.0
     frete: float = 0.0
 
-# --- GERADOR DE PIX (MERCADO PAGO) ---
+# --- PIX ---
 def gerar_pix_mercadopago(valor, descricao, email):
     if not MP_ACCESS_TOKEN: return None, None
     try:
@@ -96,83 +95,81 @@ async def chat(data: ChatRequest):
     user = data.nome_usuario or "Atleta"
     txt_low = data.texto.lower()
     
-    # 1. TRANSBORDO HUMANO (Botão de Pânico)
+    # 1. TRANSBORDO
     if "humano" in txt_low or "ajuda" in txt_low or "atendente" in txt_low:
-        enviar_telegram(f"🚨 *ALERTA:* {user} solicitou ajuda humana no chat!")
-        return {
-            "respostas": [
-                f"Entendido, {user}. Estou acionando o suporte humano.",
-                "---",
-                "Clique abaixo para falar direto com o Rafael:",
-                f"👉 [Chamar no WhatsApp](https://wa.me/{ZAP_ADMIN})"
-            ],
-            "imagem": None, "pix": None
-        }
+        enviar_telegram(f"🚨 *ALERTA:* {user} pediu ajuda humana!")
+        return {"respostas": [f"Chame o suporte humano aqui: [WhatsApp](https://wa.me/{ZAP_ADMIN})"], "imagem": None, "pix": None}
 
-    # 2. CARREGA PRODUTOS DO BANCO (Dinâmico)
+    # 2. CARREGA PRODUTOS
     produtos_disponiveis = buscar_produtos_db()
     
     produto_selecionado = None
     
-    # Tenta achar o produto pelo botão clicado (Frontend)
+    # Busca por Botão (Nome)
     if data.produto_identificado:
         for p in produtos_disponiveis:
-            if p['nome'] in data.produto_identificado: # Ex: "Creatina" in "Quero Creatina"
+            # Usa .get() para não dar erro se não tiver a coluna 'nome'
+            nome_db = p.get('nome', '')
+            if nome_db and nome_db in data.produto_identificado:
                 produto_selecionado = p
                 break
     
-    # Se não achou pelo botão, tenta achar pelo texto digitado
-    # Se não achou pelo botão, tenta achar pelo texto digitado
+    # Busca por Texto (Gatilhos) - AQUI ESTAVA O ERRO (CORRIGIDO)
     if not produto_selecionado:
         for p in produtos_disponiveis:
-            # --- CORREÇÃO (A Mágica acontece aqui) ---
-            # O .get() tenta pegar 'gatilhos'. Se não existir, ele traz vazio e não dá erro.
+            # --- PROTEÇÃO CONTRA O ERRO ---
+            # O .get() tenta pegar 'gatilhos'. Se não existir, retorna vazio e não quebra.
             raw_gatilhos = p.get('gatilhos', '') 
             
-            if raw_gatilhos: 
-                lista_gatilhos = raw_gatilhos.split(',')
-                for g in lista_gatilhos:
+            if raw_gatilhos: # Só entra aqui se tiver gatilhos
+                lista = raw_gatilhos.split(',')
+                for g in lista:
                     if g.strip() and g.strip() in txt_low:
                         produto_selecionado = p
                         break
             
             if produto_selecionado: break
 
-    # Estado da Conversa
+    # Estado
     tem_prod = produto_selecionado is not None
     tem_plano = "plano_ok=sim" in txt_low
     tem_whats = "whatsapp_ok=sim" in txt_low
     tem_local = "local_ok=sim" in txt_low 
 
-    img_url = produto_selecionado['imagem_url'] if tem_prod else None
+    # Dados seguros do produto
+    img_url = produto_selecionado.get('imagem_url', '') if tem_prod else None
+    preco_prod = produto_selecionado.get('preco', 0.0) if tem_prod else 0.0
+    nome_prod = produto_selecionado.get('nome', 'Produto') if tem_prod else ''
 
-    # --- MODO VENDA (CHECKOUT) ---
+    # --- MODO VENDA ---
     if tem_prod and tem_plano and tem_whats and tem_local:
         desconto = 0.90 if ("assinatura" in txt_low or "mensal" in txt_low) else 0.95
-        valor_final = (produto_selecionado['preco'] * desconto) + data.frete
+        valor_final = (preco_prod * desconto) + data.frete
         
-        pix_code, p_id = gerar_pix_mercadopago(valor_final, f"{produto_selecionado['nome']}-{user}", "email@teste.com")
+        pix_code, p_id = gerar_pix_mercadopago(valor_final, f"{nome_prod}-{user}", "email@teste.com")
         
         if pix_code:
             salvar_no_supabase("vendas", {
                 "nome_cliente": user, 
-                "produto": produto_selecionado['nome'], 
+                "produto": nome_prod, 
                 "valor": valor_final, 
                 "status": "AGUARDANDO_PGTO", 
                 "payment_id": p_id
             })
             return {
-                "respostas": [
-                    f"✅ Tudo certo! {produto_selecionado['nome']} reservado.", 
-                    "---", 
-                    f"Valor com desconto: R$ {valor_final:.2f}. Segue o PIX:"
-                ],
+                "respostas": [f"✅ Tudo certo! {nome_prod} reservado.", "---", f"Valor final: R$ {valor_final:.2f}. PIX abaixo:"],
                 "imagem": img_url, "pix": pix_code, "payment_id": p_id
             }
 
-    # --- MODO IA (NEGOCIAÇÃO) ---
-    # Cria o cardápio baseado no que tem no banco agora
-    cardapio_txt = "\n".join([f"- {p['nome']} (R$ {p['preco']})" for p in produtos_disponiveis])
+    # --- MODO IA ---
+    # Cria cardápio seguro
+    lista_precos = []
+    for p in produtos_disponiveis:
+        n = p.get('nome', 'Item')
+        v = p.get('preco', 0)
+        lista_precos.append(f"- {n} (R$ {v})")
+    
+    cardapio_txt = "\n".join(lista_precos)
     
     faltam = []
     if not tem_prod: faltam.append("qual produto deseja")
@@ -181,16 +178,13 @@ async def chat(data: ChatRequest):
     if not tem_local: faltam.append("o Endereço")
 
     instrucao = f"""
-    Você é Mars. Vendedor direto e eficiente.
-    
-    CARDÁPIO ATUAL (Lido do Sistema):
+    Você é Mars. Vendedor direto.
+    CARDÁPIO:
     {cardapio_txt}
     
-    ESTADO ATUAL:
-    - Produto: {produto_selecionado['nome'] if tem_prod else 'PENDENTE'}
+    PRODUTO JÁ DETECTADO: {nome_prod if tem_prod else 'Nenhum'}
     
     Peça APENAS o que falta: {', '.join(faltam)}.
-    Se o cliente perguntar preço, use EXATAMENTE os valores do cardápio acima.
     """
     
     try:
@@ -202,9 +196,8 @@ async def chat(data: ChatRequest):
         resposta_texto = completion.choices[0].message.content
         return {"respostas": [m.strip() for m in resposta_texto.split('---') if m.strip()], "imagem": img_url}
     except: 
-        return {"respostas": ["Mars reconectando sistema..."]}
+        return {"respostas": ["Mars reconectando..."]}
 
-# --- ROTAS DE SUPORTE ---
 @app.post("/salvar_lead")
 async def salvar_lead(data: dict):
     enviar_telegram(f"🔥 *LEAD:* {data.get('nome')}\n📱 {data.get('telefone')}\n🛒 {data.get('produto')}")
@@ -234,7 +227,6 @@ async def webhook_mp(request: Request):
         return {"status": "ok"}
     except: return {"status": "error"}
 
-# Dashboard Simulado (Dados Reais viriam do Supabase no futuro)
 @app.get("/dashboard_stats")
 async def dashboard_stats():
     return {
