@@ -122,13 +122,20 @@ async def chat(data: ChatRequest):
                 break
     
     # Se não achou pelo botão, tenta achar pelo texto digitado
+    # Se não achou pelo botão, tenta achar pelo texto digitado
     if not produto_selecionado:
         for p in produtos_disponiveis:
-            gatilhos = p['gatilhos'].split(',')
-            for g in gatilhos:
-                if g.strip() in txt_low:
-                    produto_selecionado = p
-                    break
+            # --- CORREÇÃO (A Mágica acontece aqui) ---
+            # O .get() tenta pegar 'gatilhos'. Se não existir, ele traz vazio e não dá erro.
+            raw_gatilhos = p.get('gatilhos', '') 
+            
+            if raw_gatilhos: 
+                lista_gatilhos = raw_gatilhos.split(',')
+                for g in lista_gatilhos:
+                    if g.strip() and g.strip() in txt_low:
+                        produto_selecionado = p
+                        break
+            
             if produto_selecionado: break
 
     # Estado da Conversa
