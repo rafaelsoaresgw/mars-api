@@ -28,22 +28,22 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN") 
+ZAP_ADMIN = "5519999999999" # SEU NUMERO AQUI (PARA O BOTÃO DE AJUDA)
 
 client = Groq(api_key=CHAVE_GROQ) if CHAVE_GROQ else None
 
 def salvar_no_supabase(tabela: str, dados: dict):
     if not SUPABASE_URL or not SUPABASE_KEY: return
     try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal"
-        }
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"}
         url = f"{SUPABASE_URL}/rest/v1/{tabela}"
         requests.post(url, json=dados, headers=headers)
-    except Exception as e:
-        print(f"Erro Supabase: {e}")
+    except Exception as e: print(f"Erro Supabase: {e}")
+
+def enviar_telegram(msg):
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True})
+        except: pass
 
 class ChatRequest(BaseModel):
     texto: str
@@ -52,153 +52,125 @@ class ChatRequest(BaseModel):
     preco_base: float = 0.0
     frete: float = 0.0
 
-# --- PIX MERCADO PAGO ROBUSTO ---
+# --- GERADOR DE PIX RETORNANDO ID ---
 def gerar_pix_mercadopago(valor, descricao, email):
-    print(f"Tentando gerar PIX de R$ {valor}...") # Log no Render
-    
-    if not MP_ACCESS_TOKEN:
-        print("❌ ERRO CRÍTICO: Token MP não encontrado nas Variáveis!")
-        return None
-        
+    if not MP_ACCESS_TOKEN: return None, None
     try:
         sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-        
-        # Garante email válido (O MP rejeita emails estranhos)
-        email_final = email if "@" in email else "cliente_mars@gmail.com"
-        
         payment_data = {
             "transaction_amount": round(float(valor), 2),
             "description": descricao,
             "payment_method_id": "pix",
-            "payer": {
-                "email": email_final,
-                "first_name": "Atleta",
-                "last_name": "Mars"
-            },
-            "installments": 1
+            "payer": {"email": "cliente@mars.com", "first_name": "Atleta", "last_name": "Mars"},
+            "notification_url": "https://mars-api1.onrender.com/webhook" # Seu link do render
         }
-        
-        print(f"Enviando dados pro MP: {payment_data}") # Log
-        
         payment_response = sdk.payment().create(payment_data)
         payment = payment_response["response"]
         
-        # Verifica se deu erro na API
-        if "status" in payment and payment["status"] == 400:
-            print(f"❌ O Mercado Pago rejeitou: {payment}")
-            return None
-
-        pix_copy_paste = payment["point_of_interaction"]["transaction_data"]["qr_code"]
-        print("✅ PIX GERADO COM SUCESSO!")
-        return pix_copy_paste
-
-    except Exception as e:
-        print("❌ ERRO NO PYTHON DO MP:")
-        traceback.print_exc() # Imprime o erro detalhado
-        return None
+        pix_copia = payment["point_of_interaction"]["transaction_data"]["qr_code"]
+        payment_id = payment["id"] # Captura o ID para monitorar
+        
+        return pix_copia, str(payment_id)
+    except:
+        traceback.print_exc()
+        return None, None
 
 @app.post("/chat")
 async def chat(data: ChatRequest):
     user = data.nome_usuario or "Atleta"
     txt_low = data.texto.lower()
     
+    # --- 1. TRANSBORDO (HUMANO) ---
+    if "humano" in txt_low or "ajuda" in txt_low or "atendente" in txt_low:
+        enviar_telegram(f"🚨 *ALERTA:* {user} pediu ajuda humana no chat!")
+        return {
+            "respostas": [
+                f"Entendi, {user}. Às vezes a tecnologia tem limites.",
+                "---",
+                "Chame o Rafael no WhatsApp Pessoal clicando abaixo:",
+                f"👉 [Falar com Rafael](https://wa.me/{ZAP_ADMIN})"
+            ],
+            "imagem": None, "pix": None
+        }
+
+    # --- 2. LÓGICA DE VENDAS ---
     tem_prod = data.produto_identificado != ""
     tem_plano = "plano_ok=sim" in txt_low
     tem_whats = "whatsapp_ok=sim" in txt_low
     tem_local = "local_ok=sim" in txt_low 
     
     pix_code = None
+    payment_id = None
     img_url = None
     
     p_id = data.produto_identificado.lower()
     ref_pix = "SUPLEMENTO"
     if "creatina" in p_id: img_url, ref_pix = "https://m.media-amazon.com/images/I/71Hfi+W5eeL.jpg", "CREATINA"
-    elif "whey" in p_id: img_url, ref_pix = "https://a-static.mlcdn.com.br/undefinedxundefined/whey-growth-concentrado-80-protein-supplements-1kg-sabores-growth-supplements/mindabraatzcosmeticos/663d6ede987211eea42f4201ac185040/15a3a5dcfb8da0785e2f5b79ebd4b4a4.jpeg", "WHEYGRWTH"
+    elif "whey" in p_id: img_url, ref_pix = "https://a-static.mlcdn.com.br/undefinedxundefined/whey-growth-concentrado-80-protein-supplements-1kg-sabores-growth-supplements/mindabraatzcosmeticos/663d6ede987211eea42f4201ac185040/15a3a5dcfb8da0785e2f5b79ebd4b4a4.jpeg", "WHEY"
 
-    # --- MODO VENDA ---
     if tem_prod and tem_plano and tem_whats and tem_local:
         desconto = 0.90 if ("assinatura" in txt_low or "mensal" in txt_low) else 0.95
-        plano_nome = "Mensal (10% OFF)" if desconto == 0.90 else "Único (5% OFF)"
         valor = (data.preco_base * desconto) + data.frete
         
-        # Tenta gerar
-        pix_code = gerar_pix_mercadopago(valor, f"{ref_pix}-{user}", "cliente_comprador@test.com")
+        pix_code, payment_id = gerar_pix_mercadopago(valor, f"{ref_pix}-{user}", "email@teste.com")
         
-        # Se falhar, avisa no chat em vez de mandar código quebrado
-        if not pix_code:
-            resposta_final = [
-                "⚠️ Ops! Tive um erro técnico ao gerar o PIX.",
-                "Já avisei o Rafael. Tente novamente em alguns minutos ou me chame no WhatsApp."
-            ]
-        else:
-            resposta_final = [
-                f"✅ Tudo certo, {user}!",
-                f"Produto: {data.produto_identificado}",
-                f"Plano: {plano_nome}",
-                f"Total c/ frete: R$ {valor:.2f}",
-                "---",
-                "Gerei seu PIX oficial abaixo:"
-            ]
-            
-            salvar_no_supabase("vendas", {
-                "nome_cliente": user,
-                "produto": ref_pix,
-                "valor": valor,
-                "status": "AGUARDANDO_PGTO"
-            })
+        if pix_code:
+            resposta_final = [f"✅ Tudo certo, {user}! Gerando seu pedido...", "---", "Aqui está o PIX com desconto aplicado:"]
+            salvar_no_supabase("vendas", {"nome_cliente": user, "produto": ref_pix, "valor": valor, "status": "AGUARDANDO_PGTO", "payment_id": payment_id})
+            return {"respostas": resposta_final, "imagem": img_url, "pix": pix_code, "payment_id": payment_id}
 
-        return {"respostas": resposta_final, "imagem": img_url, "pix": pix_code}
-
-    # --- MODO IA ---
+    # --- 3. MODO IA ---
     faltam = []
     if not tem_prod: faltam.append("qual produto deseja")
     if not tem_plano: faltam.append("o plano (Único ou Mensal)")
     if not tem_whats: faltam.append("o WhatsApp")
-    if not tem_local: faltam.append("o Endereço de entrega")
+    if not tem_local: faltam.append("o Endereço")
 
     instrucao = f"""
-    Você é Mars, vendedor da Rafael Suplementos.
-    CARDÁPIO:
-    1. Creatina (R$ 97,00)
-    2. Whey Protein (R$ 149,00)
-    3. BCAA (R$ 79,00)
-    4. Psychotic (R$ 189,00)
-    
-    PLANOS: Compra Única (5% OFF) | Assinatura Mensal (10% OFF)
-    
-    ESTADO:
-    - Produto: {data.produto_identificado if tem_prod else 'PENDENTE'}
-    - Plano: {'OK' if tem_plano else 'PENDENTE'}
-    - WhatsApp: {'OK' if tem_whats else 'PENDENTE'}
-    - Endereço: {'OK' if tem_local else 'PENDENTE'}
-    
+    Você é Mars. Venda curta e direta.
+    CARDÁPIO: Creatina (97), Whey (149).
     Peça APENAS o que falta: {', '.join(faltam)}.
     """
-
     try:
-        completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": instrucao}, {"role": "user", "content": data.texto}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.1
-        )
-        resposta_texto = completion.choices[0].message.content
-        return {"respostas": [m.strip() for m in resposta_texto.split('---') if m.strip()], "imagem": img_url, "pix": None}
-    except:
-        return {"respostas": ["Mars reconectando..."]}
+        completion = client.chat.completions.create(messages=[{"role": "system", "content": instrucao}, {"role": "user", "content": data.texto}], model="llama-3.3-70b-versatile", temperature=0.1)
+        return {"respostas": [m.strip() for m in completion.choices[0].message.content.split('---') if m.strip()], "imagem": img_url}
+    except: return {"respostas": ["Reconectando..."]}
 
 @app.post("/salvar_lead")
 async def salvar_lead(data: dict):
-    nome = data.get('nome', 'Cliente')
-    fone = data.get('telefone', '')
-    raw_produto = data.get('produto', '')
-    interesse = raw_produto.split(" | ")[0] if " | " in raw_produto else raw_produto
-    
-    link_zap = f"https://wa.me/55{fone.replace(' ','').replace('-','')}" if fone else ""
-    msg = f"🔥 *NOVO LEAD MARS*\n👤 *Cliente:* {nome}\n📱 *Zap:* [{fone}]({link_zap})\n🛒 *Pedido:* {interesse}"
-
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True})
-        except: pass
-    
-    salvar_no_supabase("leads", {"nome": nome, "telefone": fone, "info_pedido": raw_produto})
+    enviar_telegram(f"🔥 *LEAD:* {data.get('nome')}\n📱 {data.get('telefone')}\n🛒 {data.get('produto')}")
+    salvar_no_supabase("leads", data)
     return {"status": "ok"}
+
+# --- NOVAS ROTAS DE PAGAMENTO ---
+
+# 1. O site pergunta aqui se já pagou
+@app.get("/verificar_pagamento/{pid}")
+async def verificar_pagamento(pid: str):
+    if not MP_ACCESS_TOKEN: return {"status": "pending"}
+    try:
+        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+        res = sdk.payment().get(pid)
+        status = res["response"]["status"] # approved, pending, rejected
+        return {"status": status}
+    except:
+        return {"status": "error"}
+
+# 2. O Mercado Pago avisa aqui (Webhook)
+@app.post("/webhook")
+async def webhook_mp(request: Request):
+    try:
+        data = await request.json()
+        if data.get("type") == "payment":
+            p_id = data["data"]["id"]
+            sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+            payment_info = sdk.payment().get(p_id)
+            status = payment_info["response"]["status"]
+            
+            if status == "approved":
+                valor = payment_info["response"]["transaction_amount"]
+                enviar_telegram(f"💰 *PAGAMENTO APROVADO!* \nID: {p_id}\nValor: R$ {valor}")
+                
+        return {"status": "ok"}
+    except:
+        return {"status": "error"}
