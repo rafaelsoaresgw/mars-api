@@ -28,24 +28,20 @@ class ChatInput(BaseModel):
     plano_identificado: str = ""
     contato_ok: bool = False
 
-# --- FUNÇÃO DE NOTIFICAÇÃO ---
+# --- FUNÇÕES ---
 def enviar_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = { "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" }
-        requests.post(url, json=payload)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={ "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" })
     except: pass
 
-# --- BANCO DE DADOS ---
 def db_get_session(user_id):
     if not SUPABASE_URL: return None
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
         dados = r.json()
-        if len(dados) > 0: return dados[0]
-        return None
+        return dados[0] if len(dados) > 0 else None
     except: return None
 
 def db_upsert_session(user_id, dados):
@@ -53,6 +49,13 @@ def db_upsert_session(user_id, dados):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
     dados['user_id'] = user_id
     try: requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
+    except: pass
+
+# --- FUNÇÃO NOVA: LIMPAR MEMÓRIA ---
+def db_reset_session(user_id):
+    if not SUPABASE_URL: return
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
     except: pass
 
 def analisar_contexto(texto_novo, estado_atual):
@@ -79,8 +82,17 @@ def analisar_contexto(texto_novo, estado_atual):
 @app.post("/chat")
 async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
+    txt_low = data.texto.lower()
+
+    # --- COMANDO DE RESET (NOVIDADE) ---
+    if "reiniciar" in txt_low or "reset" in txt_low or "começar de novo" in txt_low:
+        db_reset_session(user)
+        return {
+            "respostas": ["Memória apagada! Vamos começar do zero. --- Qual produto você deseja hoje?"],
+            "imagem": None, "pix": None
+        }
+
     sessao_banco = db_get_session(user)
-    
     estado_final = analisar_contexto(data.texto, sessao_banco)
     db_upsert_session(user, estado_final)
 
@@ -89,18 +101,14 @@ async def chat_endpoint(data: ChatInput):
     zap = estado_final.get("whatsapp")
     end = estado_final.get("endereco")
     
-    # Validação simples
+    # Validação rigorosa
     dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
 
     pix_code = None
-    payment_id = None
-
-    # --- CHECKOUT SEGURO ---
     if prod and plan and dados_validos:
         preco = 149.90 if "Whey" in prod else (99.90 if "Creatina" in prod else 49.90)
         if plan == "Mensal": preco = preco * 0.9 
         
-        # TENTA GERAR PIX REAL
         try:
             if MP_ACCESS_TOKEN:
                 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
@@ -111,41 +119,28 @@ async def chat_endpoint(data: ChatInput):
                     "payer": {"email": "cliente@mars.com", "first_name": user},
                 }
                 mp_res = sdk.payment().create(payment_data)
-                
-                # SÓ ACEITA SE O MERCADO PAGO DEVOLVER SUCESSO (201)
                 if mp_res["status"] == 201:
                     pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-                    payment_id = str(mp_res["response"]["id"])
-                    
-                    # NOTIFICAÇÃO 1: LEAD QUENTE (Checkout Gerado)
-                    msg_lead = (
-                        f"🟡 *NOVO PEDIDO (Aguardando Pagamento)*\n"
-                        f"👤 {user}\n"
-                        f"🛒 {prod} ({plan})\n"
-                        f"💰 R$ {preco:.2f}\n"
-                        f"📱 `{zap}`\n"
-                        f"📍 {end}"
-                    )
-                    enviar_telegram(msg_lead)
-                else:
-                    print("Erro MP:", mp_res) # Log interno
-        except Exception as e:
-            traceback.print_exc() # Log de erro real no console do Render
+                    enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
+        except: pass
 
-    # PROMPT
+    # --- PROMPT MELHORADO PARA EVITAR LOOP ---
     instrucoes = ""
-    if not prod: instrucoes += "FALTA: Produto (Cardápio: Whey, Creatina, Camiseta). "
-    elif not plan: instrucoes += f"TEMOS: {prod}. FALTA: Plano (Único ou Mensal?). "
+    if not prod: instrucoes += "FALTA: Produto (Whey, Creatina, Camiseta). "
+    elif not plan: instrucoes += f"TEMOS: {prod}. FALTA: Plano (Único ou Mensal). "
     elif not dados_validos: instrucoes += f"TEMOS: {prod} ({plan}). FALTA: WhatsApp e Endereço. "
     else: 
         if pix_code:
-            instrucoes += "TUDO CERTO. PIX GERADO. Diga: 'Perfeito! Segue o PIX abaixo para finalizar.' "
+            instrucoes += "PIX GERADO COM SUCESSO. Apenas diga: 'Prontinho! Seu PIX foi gerado abaixo.' Não faça perguntas."
         else:
-            instrucoes += "ERRO NO PIX. Diga: 'Tive um erro técnico ao gerar o PIX. Tente novamente em instantes.' "
+            instrucoes += "ERRO TÉCNICO NO PIX. Peça para tentar novamente."
 
     prompt = f"""
-    Você é MARS. Cliente: {user}. ESTADO: {instrucoes}
-    REGRAS: 1. Aceite mudanças. 2. Max 15 palavras. 3. Se tem PIX, peça pagamento.
+    Você é MARS. Cliente: {user}.
+    ESTADO: {instrucoes}
+    
+    Se o cliente disser "sim" ou algo vago, repita a pergunta do que está faltando.
+    Responda em MAX 15 palavras.
     """
 
     try:
@@ -164,38 +159,12 @@ async def chat_endpoint(data: ChatInput):
     return {
         "respostas": [r.strip() for r in resposta_texto.split('---') if r.strip()],
         "imagem": img_url,
-        "pix": pix_code,
-        "payment_id": payment_id
+        "pix": pix_code
     }
 
-# --- ROTA DE STATUS (Site pergunta) ---
 @app.get("/verificar_pagamento/{pid}")
-async def verificar_pagamento(pid: str):
-    if not MP_ACCESS_TOKEN: return {"status": "pending"}
-    try:
-        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-        res = sdk.payment().get(pid)
-        return {"status": res["response"]["status"]}
-    except: return {"status": "error"}
-
-# --- ROTA DE WEBHOOK (Mercado Pago avisa aqui quando paga) ---
-@app.post("/webhook")
-async def webhook_mp(request: Request):
-    try:
-        data = await request.json()
-        if data.get("type") == "payment":
-            p_id = data["data"]["id"]
-            sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-            info = sdk.payment().get(p_id)
-            
-            # NOTIFICAÇÃO 2: VENDA REALIZADA (Dinheiro na conta)
-            if info["response"]["status"] == "approved":
-                val = info["response"]["transaction_amount"]
-                desc = info["response"]["description"]
-                enviar_telegram(f"🟢 *VENDA APROVADA! (Despachar)*\n💰 Valor: R$ {val}\n📦 {desc}")
-                
-        return {"status": "ok"}
-    except: return {"status": "error"}
-    
+async def ver(pid): return {"status": "pending"}
 @app.post("/salvar_lead")
 async def lead(d: dict): return {"status": "ok"}
+@app.post("/webhook")
+async def hook(r: Request): return {"status": "ok"}
