@@ -30,6 +30,7 @@ class ChatInput(BaseModel):
 
 # --- TELEGRAM ---
 def enviar_telegram(msg):
+    print(f"Enviando Telegram...")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -37,14 +38,15 @@ def enviar_telegram(msg):
         requests.post(url, json=payload)
     except: pass
 
-# --- BANCO DE DADOS (SUPABASE) ---
+# --- BANCO DE DADOS ---
 def db_get_session(user_id):
     if not SUPABASE_URL: return None
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
         dados = r.json()
-        return dados[0] if len(dados) > 0 else None
+        if len(dados) > 0: return dados[0]
+        return None
     except: return None
 
 def db_upsert_session(user_id, dados):
@@ -54,49 +56,39 @@ def db_upsert_session(user_id, dados):
     try: requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
     except: pass
 
-def db_reset_session(user_id):
-    if not SUPABASE_URL: return
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
-    except: pass
-
-# --- INTELIGÊNCIA DE CONTEXTO ---
+# --- CÉREBRO DA CAPTURA DE DADOS ---
 def analisar_contexto(texto_novo, estado_atual):
     novo_estado = estado_atual.copy() if estado_atual else {"produto": None, "plano": None, "whatsapp": None, "endereco": None}
     txt = texto_novo.lower()
 
-    # Detecta Produto
+    # 1. Produto
     if "whey" in txt: novo_estado["produto"] = "Whey Protein Gold"
     elif "creatina" in txt: novo_estado["produto"] = "Creatina Pura"
     elif "camiseta" in txt: novo_estado["produto"] = "Camiseta Mars"
 
-    # Detecta Plano
+    # 2. Plano
     if "mensal" in txt or "assinatura" in txt: novo_estado["plano"] = "Mensal"
     elif "unico" in txt or "único" in txt: novo_estado["plano"] = "Único"
 
-    # Detecta WhatsApp (melhorado para pegar DDD)
+    # 3. WhatsApp (Captura o número real)
     numeros = ''.join(filter(str.isdigit, txt))
+    # Se tiver mais de 8 digitos e não for o preço (149 ou 99), assumimos que é telefone
     if len(numeros) >= 8 and "149" not in numeros and "99" not in numeros: 
         novo_estado["whatsapp"] = numeros 
 
-    # Detecta Endereço
-    palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número", "cep"]
+    # 4. Endereço (Captura a mensagem toda se parecer endereço)
+    palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número"]
     if len(txt) > 5 and any(p in txt for p in palavras_chave_end):
-        novo_estado["endereco"] = texto_novo
+        novo_estado["endereco"] = texto_novo # Salva o texto original com maiúsculas
         
     return novo_estado
 
 @app.post("/chat")
 async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
-    txt_low = data.texto.lower()
-
-    # COMANDO DE RESET
-    if "reiniciar" in txt_low or "reset" in txt_low:
-        db_reset_session(user)
-        return {"respostas": ["Tudo bem! Reiniciei nosso atendimento. --- Como posso ajudar você agora?"], "imagem": None, "pix": None}
-
     sessao_banco = db_get_session(user)
+    
+    # Atualiza memória
     estado_final = analisar_contexto(data.texto, sessao_banco)
     db_upsert_session(user, estado_final)
 
@@ -105,15 +97,16 @@ async def chat_endpoint(data: ChatInput):
     zap = estado_final.get("whatsapp")
     end = estado_final.get("endereco")
     
+    # Verifica validade dos dados (tem que ter conteúdo)
     dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
 
+    # --- CHECKOUT E NOTIFICAÇÃO ---
     pix_code = None
-    payment_id = None
-
     if prod and plan and dados_validos:
         preco = 149.90 if "Whey" in prod else (99.90 if "Creatina" in prod else 49.90)
         if plan == "Mensal": preco = preco * 0.9 
         
+        pix_code = "00020126580014BR.GOV.BCB.PIX0136123e4567-e89b-12d3-a456-426614174000520400005303986540410.005802BR5913MARS AI6008BRASILIA62070503***6304ABCD"
         try:
             if MP_ACCESS_TOKEN:
                 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
@@ -126,41 +119,42 @@ async def chat_endpoint(data: ChatInput):
                 mp_res = sdk.payment().create(payment_data)
                 if mp_res["status"] == 201:
                     pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-                    payment_id = str(mp_res["response"]["id"])
-                    enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
+                    
+                    # --- MENSAGEM DETALHADA PARA O TELEGRAM ---
+                    msg_telegram = (
+                        f"🚀 *NOVA VENDA NO SITE!*\n"
+                        f"👤 *Cliente:* {user}\n"
+                        f"🛒 *Produto:* {prod}\n"
+                        f"📄 *Plano:* {plan}\n"
+                        f"💰 *Valor:* R$ {preco:.2f}\n"
+                        f"📱 *WhatsApp:* `{zap}`\n"
+                        f"📍 *Endereço:* {end}"
+                    )
+                    enviar_telegram(msg_telegram)
         except: pass
 
-    # --- AQUI ESTÁ A MUDANÇA: PERSONALIDADE DE VENDAS ---
-    status_msg = ""
-    if not prod: status_msg = "Ainda não escolheu o produto."
-    elif not plan: status_msg = f"Escolheu {prod}. Falta definir o plano."
-    elif not dados_validos: status_msg = f"Vai levar {prod} ({plan}). Falta WhatsApp e Endereço."
-    else: status_msg = "Temos todos os dados. O PIX foi gerado."
+    # --- PROMPT INTELIGENTE (DIRETO) ---
+    instrucoes = ""
+    if not prod: instrucoes += "FALTA: Produto (Cardápio: Whey, Creatina, Camiseta). "
+    elif not plan: instrucoes += f"TEMOS: {prod}. FALTA: Plano (Único ou Mensal?). "
+    elif not dados_validos: instrucoes += f"TEMOS: {prod} ({plan}). FALTA: WhatsApp e Endereço. "
+    else: instrucoes += "TEMOS TUDO. Diga: 'Perfeito! Segue o PIX abaixo.' "
 
     prompt = f"""
-    Você é a MARS, uma IA de vendas enérgica e prestativa.
-    Cliente: {user}.
+    Você é MARS, IA de vendas. Cliente: {user}.
+    ESTADO DA VENDA: {instrucoes}
     
-    SITUAÇÃO ATUAL (USE ISTO PARA SE GUIAR):
-    {status_msg}
-    
-    CARDÁPIO: Whey (149), Creatina (99), Camiseta (49).
-    
-    SUA MISSÃO:
-    1. Aja naturalmente. NUNCA diga frases robóticas como "Falta plano".
-    2. Se o cliente mudar de produto, confirme a troca com entusiasmo ("Boa escolha! A Creatina é top").
-    3. Se faltar o plano, pergunte: "Prefere garantir o desconto no Plano Mensal ou quer o Único mesmo?"
-    4. Se faltar contato, peça de forma educada para finalizar a entrega.
-    5. Se o PIX já foi gerado (verifique a SITUAÇÃO), apenas comemore e peça o pagamento.
-    
-    Responda curto (máx 20 palavras). Use '---' para pausas.
+    REGRAS:
+    1. Se o cliente pedir pra mudar, aceite e pergunte o novo.
+    2. Responda em MAX 15 palavras.
+    3. Se o PIX foi gerado, peça apenas o pagamento.
     """
 
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
-            temperature=0.3 # Aumentei um pouco para ela ser mais criativa
+            temperature=0.1
         )
         resposta_texto = resp.choices[0].message.content
     except: resposta_texto = "Conexão instável."
@@ -172,32 +166,10 @@ async def chat_endpoint(data: ChatInput):
     return {
         "respostas": [r.strip() for r in resposta_texto.split('---') if r.strip()],
         "imagem": img_url,
-        "pix": pix_code,
-        "payment_id": payment_id
+        "pix": pix_code
     }
 
 @app.get("/verificar_pagamento/{pid}")
-async def verificar_pagamento(pid: str):
-    if not MP_ACCESS_TOKEN: return {"status": "pending"}
-    try:
-        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-        res = sdk.payment().get(pid)
-        return {"status": res["response"]["status"]}
-    except: return {"status": "error"}
-
-@app.post("/webhook")
-async def webhook_mp(request: Request):
-    try:
-        data = await request.json()
-        if data.get("type") == "payment":
-            p_id = data["data"]["id"]
-            sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-            info = sdk.payment().get(p_id)
-            if info["response"]["status"] == "approved":
-                val = info["response"]["transaction_amount"]
-                enviar_telegram(f"🟢 *VENDA APROVADA! (Despachar)*\n💰 R$ {val}")
-        return {"status": "ok"}
-    except: return {"status": "error"}
-    
+async def ver(pid): return {"status": "pending"}
 @app.post("/salvar_lead")
 async def lead(d: dict): return {"status": "ok"}
