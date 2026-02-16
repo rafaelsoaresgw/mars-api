@@ -60,7 +60,7 @@ def db_reset_session(user_id):
     try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
     except: pass
 
-# --- CÉREBRO (LÓGICA) ---
+# --- CÉREBRO ---
 def analisar_contexto(texto_novo, estado_atual):
     novo_estado = estado_atual.copy() if estado_atual else {"produto": None, "plano": None, "whatsapp": None, "endereco": None}
     txt = texto_novo.lower()
@@ -94,7 +94,7 @@ async def chat_endpoint(data: ChatInput):
     # RESET
     if "reiniciar" in txt_low or "reset" in txt_low:
         db_reset_session(user)
-        return {"respostas": ["Beleza! Memória apagada. --- O que você manda hoje, atleta?"], "imagem": None, "pix": None}
+        return {"respostas": ["Memória limpa! 🧠✨ --- O que vai ser hoje?"], "imagem": None, "pix": None}
 
     sessao_banco = db_get_session(user)
     estado_final = analisar_contexto(data.texto, sessao_banco)
@@ -110,7 +110,7 @@ async def chat_endpoint(data: ChatInput):
     pix_code = None
     payment_id = None
 
-    # Lógica de Checkout
+    # TENTA GERAR O PIX PRIMEIRO
     if prod and plan and dados_validos:
         preco = 149.90 if "Whey" in prod else (99.90 if "Creatina" in prod else 49.90)
         if plan == "Mensal": preco = preco * 0.9 
@@ -125,43 +125,50 @@ async def chat_endpoint(data: ChatInput):
                     "payer": {"email": "cliente@mars.com", "first_name": user},
                 }
                 mp_res = sdk.payment().create(payment_data)
+                
+                # SUCESSO REAL
                 if mp_res["status"] == 201:
                     pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
                     payment_id = str(mp_res["response"]["id"])
                     enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
         except: pass
 
-    # --- AQUI ESTÁ A CORREÇÃO DA PERSONALIDADE ---
+    # --- PERSONALIDADE CORRIGIDA (SEM ALUCINAÇÃO) ---
     status_msg = ""
-    if not prod: status_msg = "Ainda não escolheu. (OFEREÇA O CARDÁPIO COMPLETO)."
+    if not prod: status_msg = "Ainda não escolheu. (MOSTRE O CARDÁPIO)."
     elif not plan: status_msg = f"Escolheu {prod}. Falta definir o plano (Único ou Mensal)."
     elif not dados_validos: status_msg = f"Vai levar {prod} ({plan}). Falta WhatsApp e Endereço."
-    else: status_msg = "Temos tudo. PIX JÁ GERADO."
+    else: 
+        # SÓ DIZ QUE TEM PIX SE A VARIÁVEL EXISTIR
+        if pix_code:
+            status_msg = "Tudo pronto! O PIX FOI GERADO COM SUCESSO. A peça para pagar."
+        else:
+            status_msg = "ERRO TÉCNICO: O PIX NÃO FOI GERADO. Peça para o cliente tentar novamente."
 
     prompt = f"""
-    Você é a MARS, IA da loja de suplementos.
+    Você é a MARS, IA de vendas.
     Cliente: {user}.
-    STATUS: {status_msg}
+    STATUS REAL DO SISTEMA: {status_msg}
     
     CARDÁPIO:
-    - Whey Protein Gold (R$ 149,90)
-    - Creatina Pura (R$ 99,90)
-    - Camiseta Mars (R$ 49,90)
+    - Whey Gold (R$ 149)
+    - Creatina Pura (R$ 99)
+    - Camiseta Mars (R$ 49)
     
-    SUAS REGRAS (LEIA COM ATENÇÃO):
-    1. Se o cliente perguntar "quais produtos", "o que tem" ou "o que mais", LISTE TODAS AS OPÇÕES DO CARDÁPIO acima. Não esconda o jogo!
-    2. Se o cliente escolher um produto, comemore ("Boa escolha!") e pergunte do Plano.
-    3. NUNCA peça endereço se o cliente ainda estiver escolhendo produto.
-    4. Se o PIX já foi gerado, diga: "Prontinho! Seu PIX está aqui embaixo. É só finalizar!"
+    REGRAS DE OURO:
+    1. SEJA BREVE! Máximo 15 palavras por resposta. Sem textão.
+    2. Se o cliente perguntar produtos, liste de forma resumida.
+    3. Se o status diz "PIX GERADO", comemore e aponte para baixo.
+    4. Se o status diz "ERRO TÉCNICO", seja honesta: "Tive um erro ao gerar o PIX. Tente novamente."
     
-    Responda com energia, emojis e seja natural.
+    Use emojis.
     """
 
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
-            temperature=0.3
+            temperature=0.2 # Baixei para ela falar menos besteira
         )
         resposta_texto = resp.choices[0].message.content
     except: resposta_texto = "Conexão instável."
