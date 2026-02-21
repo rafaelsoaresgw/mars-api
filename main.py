@@ -1,4 +1,5 @@
 import os, requests, mercadopago, json, re
+import traceback
 from groq import Groq
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
@@ -35,7 +36,7 @@ def enviar_telegram(msg):
                       json={ "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" })
     except: pass
 
-# --- BANCO DE DADOS ---
+# --- BANCO DE DADOS (AGORA BLINDADO E SEGURO) ---
 def db_get_session(user_id):
     uid = user_id.lower().strip()
     if not SUPABASE_URL: return None
@@ -46,12 +47,32 @@ def db_get_session(user_id):
         return dados[0] if len(dados) > 0 else None
     except: return None
 
-def db_upsert_session(user_id, dados):
+def db_upsert_session(user_id, dados, row_id=None):
     uid = user_id.lower().strip()
     if not SUPABASE_URL: return
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
-    dados['user_id'] = uid
-    try: requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
+    
+    headers = {
+        "apikey": SUPABASE_KEY, 
+        "Authorization": f"Bearer {SUPABASE_KEY}", 
+        "Content-Type": "application/json"
+    }
+    
+    # Criamos um payload limpo para o banco de dados não rejeitar a gravação
+    payload = {
+        "user_id": uid,
+        "produto": dados.get("produto"),
+        "plano": dados.get("plano"),
+        "whatsapp": dados.get("whatsapp"),
+        "endereco": dados.get("endereco")
+    }
+    
+    try:
+        if row_id:
+            # Se a memória já existe, atualiza apenas ela (PATCH)
+            requests.patch(f"{SUPABASE_URL}/rest/v1/sessoes_venda?id=eq.{row_id}", json=payload, headers=headers)
+        else:
+            # Se é a primeira vez do cliente, cria uma nova linha (POST)
+            requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=payload, headers=headers)
     except: pass
 
 def db_reset_session(user_id):
@@ -70,7 +91,7 @@ def analisar_contexto(texto_novo, estado_atual):
         "endereco": estado_atual.get("endereco") if estado_atual else None
     }
 
-    # SEGURO CONTRA BUGS ANTIGOS: Exclui telefones de 8 dígitos do banco (como o 12911522)
+    # SEGURO CONTRA BUGS ANTIGOS
     if novo_estado["whatsapp"]:
         zap_valida = re.sub(r'\D', '', str(novo_estado["whatsapp"]))
         if len(zap_valida) < 10 or len(zap_valida) > 11:
@@ -115,6 +136,10 @@ def analisar_contexto(texto_novo, estado_atual):
 
     return novo_estado
 
+@app.get("/")
+async def root():
+    return {"status": "Servidor Mars AI Online e Operante!"}
+
 @app.post("/chat")
 async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
@@ -124,9 +149,14 @@ async def chat_endpoint(data: ChatInput):
         db_reset_session(user)
         return {"respostas": ["Tudo limpo! Vamos recomeçar. Qual produto você deseja?"], "imagem": None, "pix": None}
 
+    # RECUPERA O ESTADO E A ID DO BANCO
     sessao_banco = db_get_session(user)
+    row_id = sessao_banco.get("id") if sessao_banco else None
+    
     estado_final = analisar_contexto(data.texto, sessao_banco)
-    db_upsert_session(user, estado_final)
+    
+    # SALVA USANDO A ID EXATA PARA NÃO FALHAR
+    db_upsert_session(user, estado_final, row_id)
 
     prod = estado_final.get("produto")
     plan = estado_final.get("plano")
