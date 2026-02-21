@@ -1,5 +1,4 @@
-import os, requests, mercadopago, json
-import traceback
+import os, requests, mercadopago, json, re
 from groq import Groq
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
@@ -24,55 +23,96 @@ client = Groq(api_key=CHAVE_GROQ) if CHAVE_GROQ else None
 class ChatInput(BaseModel):
     texto: str
     nome_usuario: str
+    produto_identificado: str = ""
+    plano_identificado: str = ""
+    contato_ok: bool = False
 
-# --- FUNÇÕES AUXILIARES ---
+# --- TELEGRAM ---
 def enviar_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={ "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" })
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                      json={ "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" })
     except: pass
 
+# --- BANCO DE DADOS ---
 def db_get_session(user_id):
+    uid = user_id.lower().strip()
     if not SUPABASE_URL: return None
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}&order=id.desc&limit=1", headers=headers)
         dados = r.json()
         return dados[0] if len(dados) > 0 else None
     except: return None
 
 def db_upsert_session(user_id, dados):
+    uid = user_id.lower().strip()
     if not SUPABASE_URL: return
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
-    dados['user_id'] = user_id
+    dados['user_id'] = uid
     try: requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
     except: pass
 
 def db_reset_session(user_id):
+    uid = user_id.lower().strip()
     if not SUPABASE_URL: return
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}", headers=headers)
     except: pass
 
+# --- CÉREBRO PROFISSIONAL: EXTRAÇÃO SIMULTÂNEA ---
 def analisar_contexto(texto_novo, estado_atual):
-    novo_estado = estado_atual.copy() if estado_atual else {"produto": None, "plano": None, "whatsapp": None, "endereco": None}
-    txt = texto_novo.lower()
+    novo_estado = {
+        "produto": estado_atual.get("produto") if estado_atual else None,
+        "plano": estado_atual.get("plano") if estado_atual else None,
+        "whatsapp": estado_atual.get("whatsapp") if estado_atual else None,
+        "endereco": estado_atual.get("endereco") if estado_atual else None
+    }
 
-    if "whey" in txt: novo_estado["produto"] = "Whey Protein Gold"
-    elif "creatina" in txt: novo_estado["produto"] = "Creatina Pura"
-    elif "camiseta" in txt: novo_estado["produto"] = "Camiseta Mars"
+    # SEGURO CONTRA BUGS ANTIGOS: Exclui telefones de 8 dígitos do banco (como o 12911522)
+    if novo_estado["whatsapp"]:
+        zap_valida = re.sub(r'\D', '', str(novo_estado["whatsapp"]))
+        if len(zap_valida) < 10 or len(zap_valida) > 11:
+            novo_estado["whatsapp"] = None
 
-    if "mensal" in txt or "assinatura" in txt: novo_estado["plano"] = "Mensal"
-    elif "unico" in txt or "único" in txt: novo_estado["plano"] = "Único"
+    txt_lower = texto_novo.lower().strip()
+    texto_restante = texto_novo
 
-    numeros = ''.join(filter(str.isdigit, txt))
-    if len(numeros) >= 8 and "149" not in numeros and "99" not in numeros: 
-        novo_estado["whatsapp"] = numeros 
+    # 1. PRODUTO
+    if not novo_estado["produto"]:
+        if "whey" in txt_lower: novo_estado["produto"] = "Whey Protein Gold"
+        elif "creatina" in txt_lower: novo_estado["produto"] = "Creatina Pura"
+        elif "camiseta" in txt_lower: novo_estado["produto"] = "Camiseta Mars"
 
-    palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número", "cep"]
-    if len(txt) > 5 and any(p in txt for p in palavras_chave_end):
-        novo_estado["endereco"] = texto_novo
+    # 2. PLANO
+    if not novo_estado["plano"]:
+        if "mensal" in txt_lower or "assinatura" in txt_lower: novo_estado["plano"] = "Mensal"
+        elif "unico" in txt_lower or "único" in txt_lower: novo_estado["plano"] = "Único"
+
+    # 3. WHATSAPP (A REGRA DE OURO DOS 11 DÍGITOS)
+    if not novo_estado["whatsapp"]:
+        padrao_telefone = r'\(?\d{2}\)?[\s-]?\d{4,5}[\s-]?\d{4}'
+        match = re.search(padrao_telefone, texto_restante)
         
+        if match:
+            novo_estado["whatsapp"] = re.sub(r'\D', '', match.group())
+            # Apaga o telefone da frase para não sujar o endereço
+            texto_restante = texto_restante.replace(match.group(), "").strip()
+        else:
+            blocos = re.findall(r'\b\d{10,11}\b', re.sub(r'[^\w\s]', '', texto_restante))
+            if blocos:
+                novo_estado["whatsapp"] = blocos[0]
+                texto_restante = texto_restante.replace(blocos[0], "").strip()
+
+    # 4. ENDEREÇO
+    if not novo_estado["endereco"]:
+        txt_limpo = re.sub(r'(?i)^(meu whatsapp|whatsapp|meu telefone|telefone|endere[cç]o é|endere[cç]o|cep)[:\-\s]*', '', texto_restante).strip()
+        
+        if len(txt_limpo) > 8 and not any(cmd in txt_lower for cmd in ["reiniciar", "reset"]):
+            if txt_limpo.lower() not in ["quero whey protein", "quero assinatura mensal", "whey", "creatina"]:
+                novo_estado["endereco"] = txt_limpo
+
     return novo_estado
 
 @app.post("/chat")
@@ -80,10 +120,9 @@ async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
     txt_low = data.texto.lower()
 
-    # RESET
     if "reiniciar" in txt_low or "reset" in txt_low:
         db_reset_session(user)
-        return {"respostas": ["Reiniciei seu atendimento. Como posso ajudar agora?"], "imagem": None, "pix": None}
+        return {"respostas": ["Tudo limpo! Vamos recomeçar. Qual produto você deseja?"], "imagem": None, "pix": None}
 
     sessao_banco = db_get_session(user)
     estado_final = analisar_contexto(data.texto, sessao_banco)
@@ -94,64 +133,54 @@ async def chat_endpoint(data: ChatInput):
     zap = estado_final.get("whatsapp")
     end = estado_final.get("endereco")
     
-    dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
-
     pix_code = None
-    
-    # LÓGICA DE PIX (GARANTIDA)
-    if prod and plan and dados_validos:
+    payment_id = None
+
+    if prod and plan and zap and end:
         preco = 149.90 if "Whey" in prod else (99.90 if "Creatina" in prod else 49.90)
         if plan == "Mensal": preco = preco * 0.9 
         
-        # 1. PIX DE SEGURANÇA (Sempre existe)
         pix_code = "00020126580014BR.GOV.BCB.PIX0136123e4567-e89b-12d3-a456-426614174000520400005303986540410.005802BR5913MARS AI6008BRASILIA62070503***6304ABCD"
-        
-        # 2. TENTA GERAR O REAL
+
         try:
             if MP_ACCESS_TOKEN:
                 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-                payment_data = {
+                res = sdk.payment().create({
                     "transaction_amount": round(preco, 2),
                     "description": f"{prod} ({plan})",
                     "payment_method_id": "pix",
-                    "payer": {"email": "cliente@mars.com", "first_name": user},
-                }
-                mp_res = sdk.payment().create(payment_data)
-                if mp_res["status"] == 201:
-                    pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-                    enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
+                    "payer": {"email": "cliente@mars.com", "first_name": user}
+                })
+                if res["status"] == 201:
+                    pix_code = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+                    payment_id = str(res["response"]["id"])
+                    
+                    enviar_telegram(f"🟢 *NOVO PEDIDO:*\n👤 *Cliente:* {user.upper()}\n🛒 *Produto:* {prod} ({plan})\n💰 *Valor:* R$ {preco:.2f}\n📱 *Zap:* {zap}\n📍 *Endereço:* {end}")
         except: pass
 
-    # --- PERSONALIDADE PROFISSIONAL ---
-    status_msg = ""
-    if not prod: status_msg = "Ainda não escolheu produto. (Mostre opções)."
-    elif not plan: status_msg = f"Escolheu {prod}. Falta plano (Único/Mensal)."
-    elif not dados_validos: status_msg = f"Falta WhatsApp e Endereço para entrega."
-    else: status_msg = "PIX GERADO. Agradeça e aguarde."
+    if pix_code:
+        resposta_texto = "Perfeito! Todas as informações foram processadas com sucesso. O seu código PIX foi gerado abaixo. É só copiar e pagar para finalizarmos seu pedido!"
+    else:
+        instrucao = ""
+        if not prod: instrucao = "Pergunte gentilmente qual produto o cliente quer: Whey, Creatina ou Camiseta."
+        elif not plan: instrucao = "Pergunte se o plano será Único ou Mensal."
+        elif not zap and not end: instrucao = "Alerte que falta pouco! Peça o número do WhatsApp com DDD E também o endereço completo de entrega."
+        elif not zap: instrucao = "Temos o endereço, mas faltou o WhatsApp. Peça APENAS o número do WhatsApp com DDD."
+        elif not end: instrucao = f"Temos o WhatsApp ({zap}), mas falta o Endereço. Peça APENAS o endereço completo para entrega."
 
-    prompt = f"""
-    Você é a MARS, assistente virtual profissional da loja de suplementos.
-    Cliente: {user}.
-    STATUS: {status_msg}
-    CARDÁPIO: Whey (149), Creatina (99), Camiseta (49).
-    
-    DIRETRIZES DE PERSONALIDADE:
-    1. Seja educada, acolhedora e direta. (Estilo Apple/Nubank).
-    2. Evite gírias exageradas ou emojis em excesso. Use poucos e bons.
-    3. Se o cliente perguntar produtos, liste claramente.
-    4. Se o PIX foi gerado, diga: "Perfeito! Gere o seu código de pagamento abaixo."
-    
-    Responda em no máximo 2 frases.
-    """
-
-    try:
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
-            temperature=0.2
-        )
-        resposta_texto = resp.choices[0].message.content
-    except: resposta_texto = "Conexão instável."
+        prompt = f"""
+        Você é MARS, um robô de vendas focado em conversão.
+        MISSÃO ATUAL: {instrucao}
+        REGRAS ABSOLUTAS: Siga EXATAMENTE a missão atual. Seja empático, conversacional e MUITO breve (máximo 20 palavras).
+        """
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
+                temperature=0.0
+            )
+            resposta_texto = resp.choices[0].message.content
+        except: resposta_texto = "Conexão instável. Mars reconectando..."
 
     img_url = None
     if prod and "Whey" in prod: img_url = "https://m.media-amazon.com/images/I/41sdCLWi29L._AC_SY300_SX300_QL70_ML2_.jpg"
@@ -160,12 +189,12 @@ async def chat_endpoint(data: ChatInput):
     return {
         "respostas": [r.strip() for r in resposta_texto.split('---') if r.strip()],
         "imagem": img_url,
-        "pix": pix_code
+        "pix": pix_code,
+        "payment_id": payment_id
     }
 
 @app.get("/verificar_pagamento/{pid}")
 async def verificar_pagamento(pid: str): return {"status": "pending"}
+
 @app.post("/webhook")
 async def webhook_mp(request: Request): return {"status": "ok"}
-@app.post("/salvar_lead")
-async def lead(d: dict): return {"status": "ok"}
