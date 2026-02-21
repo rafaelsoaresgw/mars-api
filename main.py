@@ -36,18 +36,22 @@ def enviar_telegram(msg):
                       json={ "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" })
     except: pass
 
-# --- BANCO DE DADOS (AGORA BLINDADO E SEGURO) ---
+# --- BANCO DE DADOS (À PROVA DE FALHAS DE SCHEMA) ---
 def db_get_session(user_id):
     uid = user_id.lower().strip()
     if not SUPABASE_URL: return None
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}&order=id.desc&limit=1", headers=headers)
+        # Busca apenas pelo user_id (sem depender de colunas específicas como 'id')
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}", headers=headers)
         dados = r.json()
-        return dados[0] if len(dados) > 0 else None
+        # Garante que não é um erro do banco e que encontrou algo
+        if isinstance(dados, list) and len(dados) > 0:
+            return dados[-1] # Retorna o último registro da lista
+        return None
     except: return None
 
-def db_upsert_session(user_id, dados, row_id=None):
+def db_upsert_session(user_id, dados, ja_existe=False):
     uid = user_id.lower().strip()
     if not SUPABASE_URL: return
     
@@ -57,7 +61,6 @@ def db_upsert_session(user_id, dados, row_id=None):
         "Content-Type": "application/json"
     }
     
-    # Criamos um payload limpo para o banco de dados não rejeitar a gravação
     payload = {
         "user_id": uid,
         "produto": dados.get("produto"),
@@ -67,11 +70,11 @@ def db_upsert_session(user_id, dados, row_id=None):
     }
     
     try:
-        if row_id:
-            # Se a memória já existe, atualiza apenas ela (PATCH)
-            requests.patch(f"{SUPABASE_URL}/rest/v1/sessoes_venda?id=eq.{row_id}", json=payload, headers=headers)
+        if ja_existe:
+            # Se a memória existe, ele injeta os dados novos por cima (PATCH robusto)
+            requests.patch(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}", json=payload, headers=headers)
         else:
-            # Se é a primeira vez do cliente, cria uma nova linha (POST)
+            # Se é novo, cria do zero (POST)
             requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=payload, headers=headers)
     except: pass
 
@@ -91,7 +94,6 @@ def analisar_contexto(texto_novo, estado_atual):
         "endereco": estado_atual.get("endereco") if estado_atual else None
     }
 
-    # SEGURO CONTRA BUGS ANTIGOS
     if novo_estado["whatsapp"]:
         zap_valida = re.sub(r'\D', '', str(novo_estado["whatsapp"]))
         if len(zap_valida) < 10 or len(zap_valida) > 11:
@@ -118,7 +120,6 @@ def analisar_contexto(texto_novo, estado_atual):
         
         if match:
             novo_estado["whatsapp"] = re.sub(r'\D', '', match.group())
-            # Apaga o telefone da frase para não sujar o endereço
             texto_restante = texto_restante.replace(match.group(), "").strip()
         else:
             blocos = re.findall(r'\b\d{10,11}\b', re.sub(r'[^\w\s]', '', texto_restante))
@@ -149,14 +150,14 @@ async def chat_endpoint(data: ChatInput):
         db_reset_session(user)
         return {"respostas": ["Tudo limpo! Vamos recomeçar. Qual produto você deseja?"], "imagem": None, "pix": None}
 
-    # RECUPERA O ESTADO E A ID DO BANCO
+    # RECUPERA O ESTADO (COM A PROTEÇÃO NOVA)
     sessao_banco = db_get_session(user)
-    row_id = sessao_banco.get("id") if sessao_banco else None
+    ja_existe = True if sessao_banco else False
     
     estado_final = analisar_contexto(data.texto, sessao_banco)
     
-    # SALVA USANDO A ID EXATA PARA NÃO FALHAR
-    db_upsert_session(user, estado_final, row_id)
+    # SALVA OU ATUALIZA A MEMÓRIA
+    db_upsert_session(user, estado_final, ja_existe)
 
     prod = estado_final.get("produto")
     plan = estado_final.get("plano")
