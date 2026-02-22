@@ -4,10 +4,12 @@ from groq import Groq
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
 
-try: from dotenv import load_dotenv; load_dotenv()
-except: pass
+try: 
+    from dotenv import load_dotenv
+    load_dotenv()
+except: 
+    pass
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -38,55 +40,40 @@ def enviar_telegram(msg):
         requests.post(url, json=payload)
     except: pass
 
-# --- BANCO DE DADOS (SUPABASE) com estratégia "sempre um só registro" ---
+# --- BANCO DE DADOS (SUPABASE) ---
 def db_get_session(user_id):
-    if not SUPABASE_URL:
-        return None  # Sem banco, não persiste
+    if not SUPABASE_URL: return None
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
-        # Busca o registro mais recente (se houver múltiplos, ordena pelo updated_at)
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}&order=updated_at.desc&limit=1",
-            headers=headers
-        )
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
         dados = r.json()
-        return dados[0] if dados else None
-    except:
-        return None
+        return dados[0] if len(dados) > 0 else None
+    except: return None
 
 def db_upsert_session(user_id, dados):
-    if not SUPABASE_URL:
-        return
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    
-    # Primeiro, deleta qualquer registro existente para este usuário
-    try:
-        requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
-    except:
-        pass
-    
-    # Agora insere o novo estado
+    if not SUPABASE_URL: return
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
     dados['user_id'] = user_id
-    dados['updated_at'] = datetime.utcnow().isoformat()
-    try:
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/sessoes_venda",
-            json=dados,
-            headers={**headers, "Content-Type": "application/json"}
-        )
-    except:
-        pass
+    try: requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
+    except: pass
 
 def db_reset_session(user_id):
-    if not SUPABASE_URL:
-        return
+    if not SUPABASE_URL: return
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try:
-        requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
-    except:
-        pass
+    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+    except: pass
 
-# --- ROTA PARA EMPRESÁRIO (pedidos realizados) ---
+# --- ROTAS DE STATUS E PEDIDOS ---
+
+@app.get("/")
+def root():
+    """Rota principal para evitar erro 404 e confirmar que a API está ativa"""
+    return {
+        "sistema": "MARS AI",
+        "status": "online",
+        "mensagem": "API rodando com sucesso! Acesse o frontend no Netlify."
+    }
+
 @app.get("/pedidos")
 def listar_pedidos():
     """Retorna todos os pedidos que já geraram PIX (sessões com pix_gerado=True)"""
@@ -109,7 +96,6 @@ def analisar_contexto(texto_novo, estado_atual):
 
     txt = texto_novo.lower()
 
-    # Detecta Produto
     if "whey" in txt:
         novo_estado["produto"] = "Whey Protein Gold"
     elif "creatina" in txt:
@@ -117,18 +103,15 @@ def analisar_contexto(texto_novo, estado_atual):
     elif "camiseta" in txt:
         novo_estado["produto"] = "Camiseta Mars"
 
-    # Detecta Plano
     if "mensal" in txt or "assinatura" in txt:
         novo_estado["plano"] = "Mensal"
     elif "unico" in txt or "único" in txt or "avista" in txt:
         novo_estado["plano"] = "Único"
 
-    # Detecta WhatsApp
     numeros = ''.join(filter(str.isdigit, txt))
     if len(numeros) >= 10 and len(numeros) <= 11:
         novo_estado["whatsapp"] = numeros
 
-    # Detecta Endereço
     palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número", "cep", "logradouro"]
     if len(txt) > 5 and any(p in txt for p in palavras_chave_end):
         novo_estado["endereco"] = texto_novo
@@ -140,7 +123,6 @@ async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
     txt_low = data.texto.lower()
 
-    # RESET
     if "reiniciar" in txt_low or "reset" in txt_low:
         db_reset_session(user)
         return {"respostas": ["Beleza! Memória apagada. --- O que você manda hoje, atleta?"], "imagem": None, "pix": None}
@@ -159,18 +141,12 @@ async def chat_endpoint(data: ChatInput):
     pix_code = None
     payment_id = None
 
-    # Lógica de Checkout: gera PIX apenas se ainda não foi gerado
     if prod and plan and dados_validos and not pix_gerado:
-        # Define preço baseado no produto
-        if "Whey" in prod:
-            preco = 149.90
-        elif "Creatina" in prod:
-            preco = 99.90
-        else:
-            preco = 49.90
+        if "Whey" in prod: preco = 149.90
+        elif "Creatina" in prod: preco = 99.90
+        else: preco = 49.90
 
-        if plan == "Mensal":
-            preco = round(preco * 0.9, 2)
+        if plan == "Mensal": preco = round(preco * 0.9, 2)
 
         try:
             if MP_ACCESS_TOKEN:
@@ -185,18 +161,15 @@ async def chat_endpoint(data: ChatInput):
                 if mp_res["status"] == 201:
                     pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
                     payment_id = str(mp_res["response"]["id"])
-                    # Marca que o PIX foi gerado
                     estado_final["pix_gerado"] = True
                     estado_final["payment_id"] = payment_id
                     enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
         except Exception as e:
             print("Erro ao gerar PIX:", e)
 
-    # Persiste o estado atualizado (substituindo o anterior)
     db_upsert_session(user, estado_final)
 
-    # --- Construção do status para o prompt ---
-    if estado_final.get("pix_gerado"):
+    if pix_gerado:
         status_msg = f"Pedido de {prod} ({plan}) já gerou PIX. Cliente pode perguntar sobre outros produtos ou status do pagamento."
     elif not prod:
         status_msg = "Cliente ainda não escolheu produto. OFEREÇA O CARDÁPIO COMPLETO."
@@ -205,14 +178,13 @@ async def chat_endpoint(data: ChatInput):
     elif not dados_validos:
         status_msg = f"Cliente vai levar {prod} ({plan}). Falta WhatsApp e Endereço."
     else:
-        status_msg = "Todos os dados coletados. PIX será gerado."
+        status_msg = f"Todos os dados coletados. PIX será gerado."
 
-    # Prompt com regras aprimoradas
     prompt = f"""
     Você é a MARS, IA da loja de suplementos.
     Cliente: {user}.
     STATUS: {status_msg}
-    Pedido já finalizado? {"sim" if estado_final.get("pix_gerado") else "não"}
+    Pedido já finalizado? {"sim" if pix_gerado else "não"}
 
     CARDÁPIO:
     - Whey Protein Gold (R$ 149,90)
@@ -220,12 +192,9 @@ async def chat_endpoint(data: ChatInput):
     - Camiseta Mars (R$ 49,90)
 
     SUAS REGRAS:
-    1. Se o cliente perguntar "quais produtos", "o que tem" ou "o que mais", LISTE TODAS AS OPÇÕES DO CARDÁPIO acima.
-    2. Se o cliente escolher um produto, comemore e pergunte do Plano.
-    3. NUNCA peça endereço se o cliente ainda estiver escolhendo produto.
-    4. Se o PIX já foi gerado e o cliente perguntar sobre produtos, liste normalmente e pergunte se ele deseja adicionar algo ao pedido atual.
-    5. Se o cliente perguntar sobre o status do pagamento, informe que está aguardando confirmação.
-    6. Responda com energia, emojis e seja natural.
+    1. Se perguntarem "quais produtos", liste todas as opções.
+    2. Se escolher um produto, comemore e pergunte o Plano (Único ou Mensal).
+    3. Responda com energia e emojis.
     """
 
     try:
@@ -236,7 +205,6 @@ async def chat_endpoint(data: ChatInput):
         )
         resposta_texto = resp.choices[0].message.content
     except Exception as e:
-        print("Erro na API Groq:", e)
         resposta_texto = "Conexão instável. Tente novamente em instantes."
 
     img_url = None
@@ -248,20 +216,18 @@ async def chat_endpoint(data: ChatInput):
     return {
         "respostas": [r.strip() for r in resposta_texto.split('---') if r.strip()],
         "imagem": img_url,
-        "pix": pix_code,        # Só será enviado na primeira vez
+        "pix": pix_code,
         "payment_id": payment_id
     }
 
 @app.get("/verificar_pagamento/{pid}")
 async def verificar_pagamento(pid: str):
-    if not MP_ACCESS_TOKEN:
-        return {"status": "pending"}
+    if not MP_ACCESS_TOKEN: return {"status": "pending"}
     try:
         sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
         res = sdk.payment().get(pid)
         return {"status": res["response"]["status"]}
-    except:
-        return {"status": "error"}
+    except: return {"status": "error"}
 
 @app.post("/webhook")
 async def webhook_mp(request: Request):
@@ -275,9 +241,4 @@ async def webhook_mp(request: Request):
                 val = info["response"]["transaction_amount"]
                 enviar_telegram(f"🟢 *VENDA APROVADA!* R$ {val}")
         return {"status": "ok"}
-    except:
-        return {"status": "error"}
-    
-@app.post("/salvar_lead")
-async def lead(d: dict):
-    return {"status": "ok"}
+    except: return {"status": "error"}
