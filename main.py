@@ -1,9 +1,10 @@
-import os, requests, mercadopago, json, re
+import os, requests, mercadopago, json
 import traceback
 from groq import Groq
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
 
 try: from dotenv import load_dotenv; load_dotenv()
 except: pass
@@ -32,200 +33,251 @@ class ChatInput(BaseModel):
 def enviar_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                      json={ "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" })
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = { "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown" }
+        requests.post(url, json=payload)
     except: pass
 
-# --- BANCO DE DADOS (À PROVA DE FALHAS DE SCHEMA) ---
+# --- BANCO DE DADOS (SUPABASE) com estratégia "sempre um só registro" ---
 def db_get_session(user_id):
-    uid = user_id.lower().strip()
-    if not SUPABASE_URL: return None
+    if not SUPABASE_URL:
+        return None  # Sem banco, não persiste
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
-        # Busca apenas pelo user_id (sem depender de colunas específicas como 'id')
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}", headers=headers)
+        # Busca o registro mais recente (se houver múltiplos, ordena pelo updated_at)
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}&order=updated_at.desc&limit=1",
+            headers=headers
+        )
         dados = r.json()
-        # Garante que não é um erro do banco e que encontrou algo
-        if isinstance(dados, list) and len(dados) > 0:
-            return dados[-1] # Retorna o último registro da lista
+        return dados[0] if dados else None
+    except:
         return None
-    except: return None
 
-def db_upsert_session(user_id, dados, ja_existe=False):
-    uid = user_id.lower().strip()
-    if not SUPABASE_URL: return
+def db_upsert_session(user_id, dados):
+    if not SUPABASE_URL:
+        return
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     
-    headers = {
-        "apikey": SUPABASE_KEY, 
-        "Authorization": f"Bearer {SUPABASE_KEY}", 
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "user_id": uid,
-        "produto": dados.get("produto"),
-        "plano": dados.get("plano"),
-        "whatsapp": dados.get("whatsapp"),
-        "endereco": dados.get("endereco")
-    }
-    
+    # Primeiro, deleta qualquer registro existente para este usuário
     try:
-        if ja_existe:
-            # Se a memória existe, ele injeta os dados novos por cima (PATCH robusto)
-            requests.patch(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}", json=payload, headers=headers)
-        else:
-            # Se é novo, cria do zero (POST)
-            requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=payload, headers=headers)
-    except: pass
+        requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+    except:
+        pass
+    
+    # Agora insere o novo estado
+    dados['user_id'] = user_id
+    dados['updated_at'] = datetime.utcnow().isoformat()
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/sessoes_venda",
+            json=dados,
+            headers={**headers, "Content-Type": "application/json"}
+        )
+    except:
+        pass
 
 def db_reset_session(user_id):
-    uid = user_id.lower().strip()
-    if not SUPABASE_URL: return
+    if not SUPABASE_URL:
+        return
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{uid}", headers=headers)
-    except: pass
+    try:
+        requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+    except:
+        pass
 
-# --- CÉREBRO PROFISSIONAL: EXTRAÇÃO SIMULTÂNEA ---
+# --- ROTA PARA EMPRESÁRIO (pedidos realizados) ---
+@app.get("/pedidos")
+def listar_pedidos():
+    """Retorna todos os pedidos que já geraram PIX (sessões com pix_gerado=True)"""
+    if not SUPABASE_URL:
+        return {"error": "Supabase não configurado"}
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?pix_gerado=eq.true", headers=headers)
+        return r.json()
+    except:
+        return {"error": "Erro ao buscar pedidos"}
+
+# --- CÉREBRO (LÓGICA) ---
 def analisar_contexto(texto_novo, estado_atual):
-    novo_estado = {
-        "produto": estado_atual.get("produto") if estado_atual else None,
-        "plano": estado_atual.get("plano") if estado_atual else None,
-        "whatsapp": estado_atual.get("whatsapp") if estado_atual else None,
-        "endereco": estado_atual.get("endereco") if estado_atual else None
-    }
+    novo_estado = estado_atual.copy() if estado_atual else {}
+    defaults = {"produto": None, "plano": None, "whatsapp": None, "endereco": None, "pix_gerado": False}
+    for k, v in defaults.items():
+        if k not in novo_estado:
+            novo_estado[k] = v
 
-    if novo_estado["whatsapp"]:
-        zap_valida = re.sub(r'\D', '', str(novo_estado["whatsapp"]))
-        if len(zap_valida) < 10 or len(zap_valida) > 11:
-            novo_estado["whatsapp"] = None
+    txt = texto_novo.lower()
 
-    txt_lower = texto_novo.lower().strip()
-    texto_restante = texto_novo
+    # Detecta Produto
+    if "whey" in txt:
+        novo_estado["produto"] = "Whey Protein Gold"
+    elif "creatina" in txt:
+        novo_estado["produto"] = "Creatina Pura"
+    elif "camiseta" in txt:
+        novo_estado["produto"] = "Camiseta Mars"
 
-    # 1. PRODUTO
-    if not novo_estado["produto"]:
-        if "whey" in txt_lower: novo_estado["produto"] = "Whey Protein Gold"
-        elif "creatina" in txt_lower: novo_estado["produto"] = "Creatina Pura"
-        elif "camiseta" in txt_lower: novo_estado["produto"] = "Camiseta Mars"
+    # Detecta Plano
+    if "mensal" in txt or "assinatura" in txt:
+        novo_estado["plano"] = "Mensal"
+    elif "unico" in txt or "único" in txt or "avista" in txt:
+        novo_estado["plano"] = "Único"
 
-    # 2. PLANO
-    if not novo_estado["plano"]:
-        if "mensal" in txt_lower or "assinatura" in txt_lower: novo_estado["plano"] = "Mensal"
-        elif "unico" in txt_lower or "único" in txt_lower: novo_estado["plano"] = "Único"
+    # Detecta WhatsApp
+    numeros = ''.join(filter(str.isdigit, txt))
+    if len(numeros) >= 10 and len(numeros) <= 11:
+        novo_estado["whatsapp"] = numeros
 
-    # 3. WHATSAPP (A REGRA DE OURO DOS 11 DÍGITOS)
-    if not novo_estado["whatsapp"]:
-        padrao_telefone = r'\(?\d{2}\)?[\s-]?\d{4,5}[\s-]?\d{4}'
-        match = re.search(padrao_telefone, texto_restante)
-        
-        if match:
-            novo_estado["whatsapp"] = re.sub(r'\D', '', match.group())
-            texto_restante = texto_restante.replace(match.group(), "").strip()
-        else:
-            blocos = re.findall(r'\b\d{10,11}\b', re.sub(r'[^\w\s]', '', texto_restante))
-            if blocos:
-                novo_estado["whatsapp"] = blocos[0]
-                texto_restante = texto_restante.replace(blocos[0], "").strip()
-
-    # 4. ENDEREÇO
-    if not novo_estado["endereco"]:
-        txt_limpo = re.sub(r'(?i)^(meu whatsapp|whatsapp|meu telefone|telefone|endere[cç]o é|endere[cç]o|cep)[:\-\s]*', '', texto_restante).strip()
-        
-        if len(txt_limpo) > 8 and not any(cmd in txt_lower for cmd in ["reiniciar", "reset"]):
-            if txt_limpo.lower() not in ["quero whey protein", "quero assinatura mensal", "whey", "creatina"]:
-                novo_estado["endereco"] = txt_limpo
+    # Detecta Endereço
+    palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número", "cep", "logradouro"]
+    if len(txt) > 5 and any(p in txt for p in palavras_chave_end):
+        novo_estado["endereco"] = texto_novo
 
     return novo_estado
-
-@app.get("/")
-async def root():
-    return {"status": "Servidor Mars AI Online e Operante!"}
 
 @app.post("/chat")
 async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
     txt_low = data.texto.lower()
 
+    # RESET
     if "reiniciar" in txt_low or "reset" in txt_low:
         db_reset_session(user)
-        return {"respostas": ["Tudo limpo! Vamos recomeçar. Qual produto você deseja?"], "imagem": None, "pix": None}
+        return {"respostas": ["Beleza! Memória apagada. --- O que você manda hoje, atleta?"], "imagem": None, "pix": None}
 
-    # RECUPERA O ESTADO (COM A PROTEÇÃO NOVA)
-    sessao_banco = db_get_session(user)
-    ja_existe = True if sessao_banco else False
-    
+    sessao_banco = db_get_session(user) or {}
     estado_final = analisar_contexto(data.texto, sessao_banco)
     
-    # SALVA OU ATUALIZA A MEMÓRIA
-    db_upsert_session(user, estado_final, ja_existe)
-
     prod = estado_final.get("produto")
     plan = estado_final.get("plano")
     zap = estado_final.get("whatsapp")
     end = estado_final.get("endereco")
-    
+    pix_gerado = estado_final.get("pix_gerado", False)
+
+    dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
+
     pix_code = None
     payment_id = None
 
-    if prod and plan and zap and end:
-        preco = 149.90 if "Whey" in prod else (99.90 if "Creatina" in prod else 49.90)
-        if plan == "Mensal": preco = preco * 0.9 
-        
-        pix_code = "00020126580014BR.GOV.BCB.PIX0136123e4567-e89b-12d3-a456-426614174000520400005303986540410.005802BR5913MARS AI6008BRASILIA62070503***6304ABCD"
+    # Lógica de Checkout: gera PIX apenas se ainda não foi gerado
+    if prod and plan and dados_validos and not pix_gerado:
+        # Define preço baseado no produto
+        if "Whey" in prod:
+            preco = 149.90
+        elif "Creatina" in prod:
+            preco = 99.90
+        else:
+            preco = 49.90
+
+        if plan == "Mensal":
+            preco = round(preco * 0.9, 2)
 
         try:
             if MP_ACCESS_TOKEN:
                 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-                res = sdk.payment().create({
-                    "transaction_amount": round(preco, 2),
+                payment_data = {
+                    "transaction_amount": preco,
                     "description": f"{prod} ({plan})",
                     "payment_method_id": "pix",
-                    "payer": {"email": "cliente@mars.com", "first_name": user}
-                })
-                if res["status"] == 201:
-                    pix_code = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-                    payment_id = str(res["response"]["id"])
-                    
-                    enviar_telegram(f"🟢 *NOVO PEDIDO:*\n👤 *Cliente:* {user.upper()}\n🛒 *Produto:* {prod} ({plan})\n💰 *Valor:* R$ {preco:.2f}\n📱 *Zap:* {zap}\n📍 *Endereço:* {end}")
-        except: pass
+                    "payer": {"email": "cliente@mars.com", "first_name": user},
+                }
+                mp_res = sdk.payment().create(payment_data)
+                if mp_res["status"] == 201:
+                    pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+                    payment_id = str(mp_res["response"]["id"])
+                    # Marca que o PIX foi gerado
+                    estado_final["pix_gerado"] = True
+                    estado_final["payment_id"] = payment_id
+                    enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
+        except Exception as e:
+            print("Erro ao gerar PIX:", e)
 
-    if pix_code:
-        resposta_texto = "Perfeito! Todas as informações foram processadas com sucesso. O seu código PIX foi gerado abaixo. É só copiar e pagar para finalizarmos seu pedido!"
+    # Persiste o estado atualizado (substituindo o anterior)
+    db_upsert_session(user, estado_final)
+
+    # --- Construção do status para o prompt ---
+    if estado_final.get("pix_gerado"):
+        status_msg = f"Pedido de {prod} ({plan}) já gerou PIX. Cliente pode perguntar sobre outros produtos ou status do pagamento."
+    elif not prod:
+        status_msg = "Cliente ainda não escolheu produto. OFEREÇA O CARDÁPIO COMPLETO."
+    elif not plan:
+        status_msg = f"Cliente escolheu {prod}. Falta definir o plano (Único ou Mensal)."
+    elif not dados_validos:
+        status_msg = f"Cliente vai levar {prod} ({plan}). Falta WhatsApp e Endereço."
     else:
-        instrucao = ""
-        if not prod: instrucao = "Pergunte gentilmente qual produto o cliente quer: Whey, Creatina ou Camiseta."
-        elif not plan: instrucao = "Pergunte se o plano será Único ou Mensal."
-        elif not zap and not end: instrucao = "Alerte que falta pouco! Peça o número do WhatsApp com DDD E também o endereço completo de entrega."
-        elif not zap: instrucao = "Temos o endereço, mas faltou o WhatsApp. Peça APENAS o número do WhatsApp com DDD."
-        elif not end: instrucao = f"Temos o WhatsApp ({zap}), mas falta o Endereço. Peça APENAS o endereço completo para entrega."
+        status_msg = "Todos os dados coletados. PIX será gerado."
 
-        prompt = f"""
-        Você é MARS, um robô de vendas focado em conversão.
-        MISSÃO ATUAL: {instrucao}
-        REGRAS ABSOLUTAS: Siga EXATAMENTE a missão atual. Seja empático, conversacional e MUITO breve (máximo 20 palavras).
-        """
-        try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
-                temperature=0.0
-            )
-            resposta_texto = resp.choices[0].message.content
-        except: resposta_texto = "Conexão instável. Mars reconectando..."
+    # Prompt com regras aprimoradas
+    prompt = f"""
+    Você é a MARS, IA da loja de suplementos.
+    Cliente: {user}.
+    STATUS: {status_msg}
+    Pedido já finalizado? {"sim" if estado_final.get("pix_gerado") else "não"}
+
+    CARDÁPIO:
+    - Whey Protein Gold (R$ 149,90)
+    - Creatina Pura (R$ 99,90)
+    - Camiseta Mars (R$ 49,90)
+
+    SUAS REGRAS:
+    1. Se o cliente perguntar "quais produtos", "o que tem" ou "o que mais", LISTE TODAS AS OPÇÕES DO CARDÁPIO acima.
+    2. Se o cliente escolher um produto, comemore e pergunte do Plano.
+    3. NUNCA peça endereço se o cliente ainda estiver escolhendo produto.
+    4. Se o PIX já foi gerado e o cliente perguntar sobre produtos, liste normalmente e pergunte se ele deseja adicionar algo ao pedido atual.
+    5. Se o cliente perguntar sobre o status do pagamento, informe que está aguardando confirmação.
+    6. Responda com energia, emojis e seja natural.
+    """
+
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
+            temperature=0.3
+        )
+        resposta_texto = resp.choices[0].message.content
+    except Exception as e:
+        print("Erro na API Groq:", e)
+        resposta_texto = "Conexão instável. Tente novamente em instantes."
 
     img_url = None
-    if prod and "Whey" in prod: img_url = "https://m.media-amazon.com/images/I/41sdCLWi29L._AC_SY300_SX300_QL70_ML2_.jpg"
-    elif prod and "Creatina" in prod: img_url = "https://http2.mlstatic.com/D_NQ_NP_2X_942122-MLA99923169249_112025-F.webp"
+    if prod and "Whey" in prod:
+        img_url = "https://m.media-amazon.com/images/I/41sdCLWi29L._AC_SY300_SX300_QL70_ML2_.jpg"
+    elif prod and "Creatina" in prod:
+        img_url = "https://http2.mlstatic.com/D_NQ_NP_2X_942122-MLA99923169249_112025-F.webp"
 
     return {
         "respostas": [r.strip() for r in resposta_texto.split('---') if r.strip()],
         "imagem": img_url,
-        "pix": pix_code,
+        "pix": pix_code,        # Só será enviado na primeira vez
         "payment_id": payment_id
     }
 
 @app.get("/verificar_pagamento/{pid}")
-async def verificar_pagamento(pid: str): return {"status": "pending"}
+async def verificar_pagamento(pid: str):
+    if not MP_ACCESS_TOKEN:
+        return {"status": "pending"}
+    try:
+        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+        res = sdk.payment().get(pid)
+        return {"status": res["response"]["status"]}
+    except:
+        return {"status": "error"}
 
 @app.post("/webhook")
-async def webhook_mp(request: Request): return {"status": "ok"}
+async def webhook_mp(request: Request):
+    try:
+        data = await request.json()
+        if data.get("type") == "payment":
+            p_id = data["data"]["id"]
+            sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+            info = sdk.payment().get(p_id)
+            if info["response"]["status"] == "approved":
+                val = info["response"]["transaction_amount"]
+                enviar_telegram(f"🟢 *VENDA APROVADA!* R$ {val}")
+        return {"status": "ok"}
+    except:
+        return {"status": "error"}
+    
+@app.post("/salvar_lead")
+async def lead(d: dict):
+    return {"status": "ok"}
