@@ -27,6 +27,9 @@ client = Groq(api_key=CHAVE_GROQ) if CHAVE_GROQ else None
 class ChatInput(BaseModel):
     texto: str
     nome_usuario: str
+    produto_identificado: str = ""
+    plano_identificado: str = ""
+    contato_ok: bool = False
 
 # --- TELEGRAM ---
 def enviar_telegram(msg):
@@ -44,8 +47,8 @@ def db_get_session(user_id):
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
         dados = r.json()
-        return dados[0] if len(dados) > 0 else {}
-    except: return {}
+        return dados[0] if len(dados) > 0 else None
+    except: return None
 
 def db_upsert_session(user_id, dados):
     if not SUPABASE_URL: return
@@ -60,125 +63,188 @@ def db_reset_session(user_id):
     try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
     except: pass
 
-# --- CÉREBRO (LÓGICA DE CONTEXTO) ---
-def analisar_contexto(texto_novo, estado_atual):
-    novo_estado = estado_atual.copy() if estado_atual else {}
-    
-    # Garante campos padrão
-    for k in ["produto", "plano", "whatsapp", "endereco", "pix_gerado"]:
-        if k not in novo_estado: novo_estado[k] = None
-
-    txt = texto_novo.lower()
-
-    # DETEÇÃO DE PRODUTO (Só muda se detetar um novo)
-    if "whey" in txt: novo_estado["produto"] = "Whey Protein Gold"
-    elif "creatina" in txt: novo_estado["produto"] = "Creatina Pura"
-    elif "camiseta" in txt: novo_estado["produto"] = "Camiseta Mars"
-
-    # DETEÇÃO DE PLANO
-    if "mensal" in txt or "assinatura" in txt:
-        novo_estado["plano"] = "Mensal"
-    elif any(x in txt for x in ["unico", "único", "avista", "à vista", "uma vez"]):
-        novo_estado["plano"] = "Único"
-
-    # DETEÇÃO DE CONTACTO
-    numeros = ''.join(filter(str.isdigit, txt))
-    if 10 <= len(numeros) <= 11:
-        novo_estado["whatsapp"] = numeros
-
-    # DETEÇÃO DE ENDEREÇO
-    keywords = ["rua", "av", "avenida", "bairro", "casa", "apto", "entrega", "cep", "nº", "numero"]
-    if len(txt) > 8 and any(k in txt for k in keywords):
-        novo_estado["endereco"] = texto_novo
-
-    return novo_estado
+# --- ROTAS DE STATUS E PEDIDOS ---
 
 @app.get("/")
 def root():
-    return {"sistema": "MARS AI", "status": "online"}
+    """Rota principal para evitar erro 404 e confirmar que a API está ativa"""
+    return {
+        "sistema": "MARS AI",
+        "status": "online",
+        "mensagem": "API rodando com sucesso! Acesse o frontend no Netlify."
+    }
+
+@app.get("/pedidos")
+def listar_pedidos():
+    """Retorna todos os pedidos que já geraram PIX (sessões com pix_gerado=True)"""
+    if not SUPABASE_URL:
+        return {"error": "Supabase não configurado"}
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?pix_gerado=eq.true", headers=headers)
+        return r.json()
+    except:
+        return {"error": "Erro ao buscar pedidos"}
+
+# --- CÉREBRO (LÓGICA) ---
+def analisar_contexto(texto_novo, estado_atual):
+    novo_estado = estado_atual.copy() if estado_atual else {}
+    defaults = {"produto": None, "plano": None, "whatsapp": None, "endereco": None, "pix_gerado": False}
+    for k, v in defaults.items():
+        if k not in novo_estado:
+            novo_estado[k] = v
+
+    txt = texto_novo.lower()
+
+    if "whey" in txt:
+        novo_estado["produto"] = "Whey Protein Gold"
+    elif "creatina" in txt:
+        novo_estado["produto"] = "Creatina Pura"
+    elif "camiseta" in txt:
+        novo_estado["produto"] = "Camiseta Mars"
+
+    if "mensal" in txt or "assinatura" in txt:
+        novo_estado["plano"] = "Mensal"
+    elif "unico" in txt or "único" in txt or "avista" in txt:
+        novo_estado["plano"] = "Único"
+
+    numeros = ''.join(filter(str.isdigit, txt))
+    if len(numeros) >= 10 and len(numeros) <= 11:
+        novo_estado["whatsapp"] = numeros
+
+    palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número", "cep", "logradouro"]
+    if len(txt) > 5 and any(p in txt for p in palavras_chave_end):
+        novo_estado["endereco"] = texto_novo
+
+    return novo_estado
 
 @app.post("/chat")
 async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
     txt_low = data.texto.lower()
 
-    if any(x in txt_low for x in ["reiniciar", "reset", "limpar"]):
+    if "reiniciar" in txt_low or "reset" in txt_low:
         db_reset_session(user)
-        return {"respostas": ["Memória resetada! O que vamos treinar hoje?"], "imagem": None, "pix": None}
+        return {"respostas": ["Beleza! Memória apagada. --- O que você manda hoje, atleta?"], "imagem": None, "pix": None}
 
-    sessao = db_get_session(user)
-    estado = analisar_contexto(data.texto, sessao)
+    sessao_banco = db_get_session(user) or {}
+    estado_final = analisar_contexto(data.texto, sessao_banco)
     
-    prod = estado.get("produto")
-    plan = estado.get("plano")
-    zap = estado.get("whatsapp")
-    end = estado.get("endereco")
-    pix_gerado = estado.get("pix_gerado", False)
+    prod = estado_final.get("produto")
+    plan = estado_final.get("plano")
+    zap = estado_final.get("whatsapp")
+    end = estado_final.get("endereco")
+    pix_gerado = estado_final.get("pix_gerado", False)
 
-    # Lógica de Status para a IA
+    dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
+
+    pix_code = None
+    payment_id = None
+
+    if prod and plan and dados_validos and not pix_gerado:
+        if "Whey" in prod: preco = 149.90
+        elif "Creatina" in prod: preco = 99.90
+        else: preco = 49.90
+
+        if plan == "Mensal": preco = round(preco * 0.9, 2)
+
+        try:
+            if MP_ACCESS_TOKEN:
+                sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+                payment_data = {
+                    "transaction_amount": preco,
+                    "description": f"{prod} ({plan})",
+                    "payment_method_id": "pix",
+                    "payer": {"email": "cliente@mars.com", "first_name": user},
+                }
+                mp_res = sdk.payment().create(payment_data)
+                if mp_res["status"] == 201:
+                    pix_code = mp_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+                    payment_id = str(mp_res["response"]["id"])
+                    estado_final["pix_gerado"] = True
+                    estado_final["payment_id"] = payment_id
+                    enviar_telegram(f"🟡 *NOVO PEDIDO:*\n👤 {user}\n🛒 {prod} ({plan})\n💰 R$ {preco:.2f}\n📱 `{zap}`\n📍 {end}")
+        except Exception as e:
+            print("Erro ao gerar PIX:", e)
+
+    db_upsert_session(user, estado_final)
+
     if pix_gerado:
-        status_msg = f"PEDIDO CONCLUÍDO de {prod}. Ele já tem o PIX."
-    elif prod and not plan:
-        status_msg = f"O cliente ESCOLHEU {prod}. Agora OBRIGATORIAMENTE pergunte se ele quer o plano ÚNICO ou MENSAL (com 10% desc)."
-    elif prod and plan and (not zap or not end):
-        status_msg = f"Produto: {prod}, Plano: {plan}. Agora peça o WhatsApp e Endereço para entrega."
+        status_msg = f"Pedido de {prod} ({plan}) já gerou PIX. Cliente pode perguntar sobre outros produtos ou status do pagamento."
     elif not prod:
-        status_msg = "Cliente ainda não escolheu. APRESENTE O CARDÁPIO: Whey (149,90), Creatina (99,90), Camiseta (49,90)."
+        status_msg = "Cliente ainda não escolheu produto. OFEREÇA O CARDÁPIO COMPLETO."
+    elif not plan:
+        status_msg = f"Cliente escolheu {prod}. Falta definir o plano (Único ou Mensal)."
+    elif not dados_validos:
+        status_msg = f"Cliente vai levar {prod} ({plan}). Falta WhatsApp e Endereço."
     else:
-        status_msg = "Tudo pronto. Gerando PIX."
+        status_msg = f"Todos os dados coletados. PIX será gerado."
 
+    # ========== PROMPT CORRIGIDO E REFORÇADO ==========
     prompt = f"""
-    Você é a MARS, IA da loja de suplementos. Seja motivadora e direta.
-    Contexto Atual: {status_msg}
-    Cliente: {user}
-    
-    REGRAS:
-    1. Se o cliente já escolheu o produto, NÃO ofereça o cardápio de novo. Foque no próximo passo (Plano ou Dados).
-    2. Use emojis de treino.
-    3. Se o status diz que falta o Plano, insista apenas no Plano.
+    Você é a MARS, assistente virtual da loja de suplementos.  
+    Cliente: {user}.  
+    Status atual: {status_msg}.  
+
+    Use emojis e tom motivacional, mas seja direta.
+
+    **REGRAS RÍGIDAS (siga exatamente):**
+
+    1. **Leia o Status atual com atenção.** Ele diz o que já foi coletado e o que falta.
+
+    2. Se o cliente **já escolheu um produto** (ex: Creatina) e **ainda não escolheu o plano** → pergunte APENAS o plano (Único ou Mensal).  
+       Ex: "BOA! Creatina é energia pura! 💪 Vai querer plano Único ou Mensal? (Mensal tem 10% de desconto)"
+
+    3. Se o cliente **já escolheu produto E plano**, mas **faltam WhatsApp e/ou endereço** → peça os dados que faltam.  
+       - Se falta endereço: "Perfeito! Agora manda o endereço de entrega, por favor."  
+       - Se falta WhatsApp: "Show! Agora me passa seu WhatsApp pra finalizar."  
+       - Se faltam ambos: "Quase lá! Me passa seu WhatsApp e endereço pra entrega."
+
+    4. Se o cliente **ainda não escolheu produto** → apresente o cardápio.  
+       Cardápio:  
+       💊 Creatina Pura R$99,90  
+       🥛 Whey Gold R$149,90  
+       👕 Camiseta Mars R$49,90  
+       Planos: 🔁 Mensal (10% desconto) | 🎯 Único
+
+    5. Se o cliente **já tem PIX gerado** → informe e pergunte se quer mais algo ou ver status.
+
+    6. **NUNCA repita perguntas desnecessárias.** Se o cliente já respondeu algo, não pergunte de novo.
+
+    7. **Interpretação de palavras-chave:**  
+       - "único", "unico", "avista", "à vista" significam **plano Único**.  
+       - "mensal", "assinatura" significam **plano Mensal**.  
+       - Se o status disser que o produto já foi escolhido e você receber uma dessas palavras, responda confirmando o plano e peça os dados de contato (se ainda não tiver).  
+       - **Nunca** liste produtos novamente quando o cliente já tiver escolhido um, a menos que ele peça explicitamente "quais produtos vocês vendem?".
+
+    **Exemplos de respostas corretas:**
+
+    - Cliente: "quero creatina" (status: produto não escolhido) → "Creatina é pré-treino top! 💊 Vai querer plano Único ou Mensal? (Mensal 10% off)"
+    - Cliente: "plano unico" (status: produto já escolhido, falta plano) → "Fechou, plano Único! Agora me passa seu WhatsApp e endereço, por favor."
+    - Cliente: "único" (status: produto já escolhido, falta plano) → "Show, plano Único! Agora preciso do seu WhatsApp e endereço para entrega, pode mandar?"
+    - Cliente: "meu zap é 11999999999" (status: falta endereço) → "WhatsApp salvo! Agora manda o endereço de entrega."
+    - Cliente: "rua x, 123" (status: falta WhatsApp) → "Endereço anotado! Só falta o WhatsApp pra gerar o PIX."
+    - Cliente: "qual o status do meu pedido?" (status: PIX já gerado) → "Seu pagamento está sendo processado. Assim que confirmarmos, avisamos! Quer aproveitar e pedir mais algo? 🚀"
+    - Cliente: "quais produtos vocês vendem?" (qualquer status) → liste o cardápio.
+
+    Mantenha as respostas curtas, energéticas e SEMPRE baseadas no status atual.
     """
 
-    # Gerar resposta via Groq
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": data.texto}],
-            temperature=0.4
+            temperature=0.3
         )
         resposta_texto = resp.choices[0].message.content
-    except:
-        resposta_texto = "Estou com um pequeno lag nos sensores. Podes repetir?"
-
-    # Geração de PIX (se tiver tudo e ainda não gerou)
-    pix_code = None
-    payment_id = None
-    if prod and plan and zap and end and not pix_gerado:
-        # Preços
-        precos = {"Whey Protein Gold": 149.90, "Creatina Pura": 99.90, "Camiseta Mars": 49.90}
-        valor = precos.get(prod, 50.0)
-        if plan == "Mensal": valor *= 0.9
-        
-        try:
-            sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-            pay_res = sdk.payment().create({
-                "transaction_amount": round(valor, 2),
-                "description": f"{prod} - {plan}",
-                "payment_method_id": "pix",
-                "payer": {"email": "cliente@mars.com"}
-            })
-            if pay_res["status"] == 201:
-                pix_code = pay_res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-                payment_id = str(pay_res["response"]["id"])
-                estado["pix_gerado"] = True
-                estado["payment_id"] = payment_id
-                enviar_telegram(f"🔥 *NOVO PIX:* {user} - {prod} (R$ {valor:.2f})")
-        except: pass
-
-    db_upsert_session(user, estado)
+    except Exception as e:
+        resposta_texto = "Conexão instável. Tente novamente em instantes."
 
     img_url = None
-    if prod == "Whey Protein Gold": img_url = "https://m.media-amazon.com/images/I/41sdCLWi29L._AC_SY300_SX300_QL70_ML2_.jpg"
-    elif prod == "Creatina Pura": img_url = "https://http2.mlstatic.com/D_NQ_NP_2X_942122-MLA99923169249_112025-F.webp"
+    if prod and "Whey" in prod:
+        img_url = "https://m.media-amazon.com/images/I/41sdCLWi29L._AC_SY300_SX300_QL70_ML2_.jpg"
+    elif prod and "Creatina" in prod:
+        img_url = "https://http2.mlstatic.com/D_NQ_NP_2X_942122-MLA99923169249_112025-F.webp"
 
     return {
         "respostas": [r.strip() for r in resposta_texto.split('---') if r.strip()],
@@ -189,8 +255,23 @@ async def chat_endpoint(data: ChatInput):
 
 @app.get("/verificar_pagamento/{pid}")
 async def verificar_pagamento(pid: str):
+    if not MP_ACCESS_TOKEN: return {"status": "pending"}
     try:
         sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
         res = sdk.payment().get(pid)
         return {"status": res["response"]["status"]}
+    except: return {"status": "error"}
+
+@app.post("/webhook")
+async def webhook_mp(request: Request):
+    try:
+        data = await request.json()
+        if data.get("type") == "payment":
+            p_id = data["data"]["id"]
+            sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+            info = sdk.payment().get(p_id)
+            if info["response"]["status"] == "approved":
+                val = info["response"]["transaction_amount"]
+                enviar_telegram(f"🟢 *VENDA APROVADA!* R$ {val}")
+        return {"status": "ok"}
     except: return {"status": "error"}
