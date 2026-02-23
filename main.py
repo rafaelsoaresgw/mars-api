@@ -121,12 +121,14 @@ def analisar_contexto(texto_novo, estado_atual):
 @app.post("/chat")
 async def chat_endpoint(data: ChatInput):
     user = data.nome_usuario
-    txt_low = data.texto.lower()
+    txt_low = data.texto.lower().strip()
 
+    # Comando de reset
     if "reiniciar" in txt_low or "reset" in txt_low:
         db_reset_session(user)
         return {"respostas": ["Beleza! Memória apagada. --- O que você manda hoje, atleta?"], "imagem": None, "pix": None}
 
+    # Carrega estado atual do banco
     sessao_banco = db_get_session(user) or {}
     estado_final = analisar_contexto(data.texto, sessao_banco)
     
@@ -138,6 +140,23 @@ async def chat_endpoint(data: ChatInput):
 
     dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
 
+    # ========== INTERVENÇÃO MANUAL PARA GARANTIR FLUXO ==========
+    # Se o cliente já escolheu um produto, mas ainda não escolheu o plano,
+    # e a mensagem for exatamente "mensal" ou "único" (ou variações),
+    # definimos o plano manualmente e já pedimos contato, sem usar a IA.
+    if prod and not plan:
+        if txt_low in ["mensal", "mensal", "unico", "único", "avista", "à vista"]:
+            plano_escolhido = "Mensal" if "mensal" in txt_low else "Único"
+            estado_final["plano"] = plano_escolhido
+            plan = plano_escolhido
+            db_upsert_session(user, estado_final)
+            return {
+                "respostas": [f"Fechou, plano {plano_escolhido}! Agora me passa seu WhatsApp e endereço, por favor."],
+                "imagem": None,
+                "pix": None
+            }
+
+    # ========== GERAÇÃO DE PIX (se todos os dados estiverem preenchidos) ==========
     pix_code = None
     payment_id = None
 
@@ -169,6 +188,7 @@ async def chat_endpoint(data: ChatInput):
 
     db_upsert_session(user, estado_final)
 
+    # ========== CONSTRUÇÃO DO STATUS_MSG ==========
     if pix_gerado:
         status_msg = f"Pedido de {prod} ({plan}) já gerou PIX. Cliente pode perguntar sobre outros produtos ou status do pagamento."
     elif not prod:
@@ -222,6 +242,7 @@ async def chat_endpoint(data: ChatInput):
     - Cliente: "quero creatina" (status: produto não escolhido) → "Creatina é pré-treino top! 💊 Vai querer plano Único ou Mensal? (Mensal 10% off)"
     - Cliente: "plano unico" (status: produto já escolhido, falta plano) → "Fechou, plano Único! Agora me passa seu WhatsApp e endereço, por favor."
     - Cliente: "único" (status: produto já escolhido, falta plano) → "Show, plano Único! Agora preciso do seu WhatsApp e endereço para entrega, pode mandar?"
+    - Cliente: "mensal" (status: produto já escolhido, falta plano) → "Fechou, plano Mensal! Agora me passa seu WhatsApp e endereço, por favor."
     - Cliente: "meu zap é 11999999999" (status: falta endereço) → "WhatsApp salvo! Agora manda o endereço de entrega."
     - Cliente: "rua x, 123" (status: falta WhatsApp) → "Endereço anotado! Só falta o WhatsApp pra gerar o PIX."
     - Cliente: "qual o status do meu pedido?" (status: PIX já gerado) → "Seu pagamento está sendo processado. Assim que confirmarmos, avisamos! Quer aproveitar e pedir mais algo? 🚀"
