@@ -67,7 +67,6 @@ def db_reset_session(user_id):
 
 @app.get("/")
 def root():
-    """Rota principal para evitar erro 404 e confirmar que a API está ativa"""
     return {
         "sistema": "MARS AI",
         "status": "online",
@@ -76,7 +75,6 @@ def root():
 
 @app.get("/pedidos")
 def listar_pedidos():
-    """Retorna todos os pedidos que já geraram PIX (sessões com pix_gerado=True)"""
     if not SUPABASE_URL:
         return {"error": "Supabase não configurado"}
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -138,25 +136,44 @@ async def chat_endpoint(data: ChatInput):
     end = estado_final.get("endereco")
     pix_gerado = estado_final.get("pix_gerado", False)
 
+    # LOGS PARA DEPURAÇÃO
+    print(f"--- DEBUG ---")
+    print(f"Usuário: {user}")
+    print(f"Mensagem: {data.texto}")
+    print(f"Produto: {prod}")
+    print(f"Plano: {plan}")
+    print(f"WhatsApp: {zap}")
+    print(f"Endereço: {end}")
+    print(f"PIX gerado: {pix_gerado}")
+
     dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
 
-    # ========== INTERVENÇÃO MANUAL PARA GARANTIR FLUXO ==========
+    # ========== INTERVENÇÃO MANUAL REFORÇADA ==========
     # Se o cliente já escolheu um produto, mas ainda não escolheu o plano,
-    # e a mensagem for exatamente "mensal" ou "único" (ou variações),
-    # definimos o plano manualmente e já pedimos contato, sem usar a IA.
+    # e a mensagem contém "mensal" ou "unico" (ou variações), definimos o plano manualmente.
     if prod and not plan:
-        if txt_low in ["mensal", "mensal", "unico", "único", "avista", "à vista"]:
-            plano_escolhido = "Mensal" if "mensal" in txt_low else "Único"
-            estado_final["plano"] = plano_escolhido
-            plan = plano_escolhido
+        if "mensal" in txt_low or "assinatura" in txt_low:
+            print(">>> Intervenção: plano Mensal detectado")
+            estado_final["plano"] = "Mensal"
+            plan = "Mensal"
             db_upsert_session(user, estado_final)
             return {
-                "respostas": [f"Fechou, plano {plano_escolhido}! Agora me passa seu WhatsApp e endereço, por favor."],
+                "respostas": [f"Fechou, plano Mensal! Agora me passa seu WhatsApp e endereço, por favor."],
+                "imagem": None,
+                "pix": None
+            }
+        elif "unico" in txt_low or "único" in txt_low or "avista" in txt_low:
+            print(">>> Intervenção: plano Único detectado")
+            estado_final["plano"] = "Único"
+            plan = "Único"
+            db_upsert_session(user, estado_final)
+            return {
+                "respostas": [f"Fechou, plano Único! Agora me passa seu WhatsApp e endereço, por favor."],
                 "imagem": None,
                 "pix": None
             }
 
-    # ========== GERAÇÃO DE PIX (se todos os dados estiverem preenchidos) ==========
+    # ========== GERAÇÃO DE PIX ==========
     pix_code = None
     payment_id = None
 
@@ -200,7 +217,7 @@ async def chat_endpoint(data: ChatInput):
     else:
         status_msg = f"Todos os dados coletados. PIX será gerado."
 
-    # ========== PROMPT CORRIGIDO E REFORÇADO ==========
+    # ========== PROMPT (mantido igual, mas agora com status correto) ==========
     prompt = f"""
     Você é a MARS, assistente virtual da loja de suplementos.  
     Cliente: {user}.  
