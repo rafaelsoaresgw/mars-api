@@ -24,6 +24,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 client = Groq(api_key=CHAVE_GROQ) if CHAVE_GROQ else None
 
+# --- FALLBACK EM MEMÓRIA (caso Supabase não esteja disponível) ---
+sessoes_memoria = {}
+
 class ChatInput(BaseModel):
     texto: str
     nome_usuario: str
@@ -40,31 +43,59 @@ def enviar_telegram(msg):
         requests.post(url, json=payload)
     except: pass
 
-# --- BANCO DE DADOS (SUPABASE) ---
+# --- BANCO DE DADOS (SUPABASE) COM FALLBACK EM MEMÓRIA ---
 def db_get_session(user_id):
-    if not SUPABASE_URL: return None
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
-        dados = r.json()
-        return dados[0] if len(dados) > 0 else None
-    except: return None
+    # Tenta buscar no Supabase primeiro
+    if SUPABASE_URL and SUPABASE_KEY:
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+            if r.status_code == 200:
+                dados = r.json()
+                if len(dados) > 0:
+                    print(f"✅ Supabase: sessão encontrada para {user_id}")
+                    return dados[0]
+                else:
+                    print(f"⚠️ Supabase: nenhuma sessão para {user_id}")
+            else:
+                print(f"❌ Supabase: erro {r.status_code} ao buscar {user_id}")
+        except Exception as e:
+            print(f"❌ Supabase: exceção ao buscar {user_id}: {e}")
+    
+    # Fallback para memória
+    print(f"💾 Usando fallback em memória para {user_id}")
+    return sessoes_memoria.get(user_id, {})
 
 def db_upsert_session(user_id, dados):
-    if not SUPABASE_URL: return
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
-    dados['user_id'] = user_id
-    try: requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
-    except: pass
+    # Tenta salvar no Supabase primeiro
+    if SUPABASE_URL and SUPABASE_KEY:
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", 
+                   "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
+        dados['user_id'] = user_id
+        try:
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/sessoes_venda", json=dados, headers=headers)
+            if r.status_code in [200, 201, 204]:
+                print(f"✅ Supabase: sessão salva para {user_id}")
+            else:
+                print(f"❌ Supabase: erro {r.status_code} ao salvar {user_id}")
+        except Exception as e:
+            print(f"❌ Supabase: exceção ao salvar {user_id}: {e}")
+    
+    # Sempre salva na memória também
+    sessoes_memoria[user_id] = {**sessoes_memoria.get(user_id, {}), **dados}
+    print(f"💾 Memória atualizada para {user_id}: {sessoes_memoria[user_id]}")
 
 def db_reset_session(user_id):
-    if not SUPABASE_URL: return
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try: requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
-    except: pass
+    if SUPABASE_URL and SUPABASE_KEY:
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        try:
+            requests.delete(f"{SUPABASE_URL}/rest/v1/sessoes_venda?user_id=eq.{user_id}", headers=headers)
+        except: pass
+    # Remove da memória
+    if user_id in sessoes_memoria:
+        del sessoes_memoria[user_id]
 
 # --- ROTAS DE STATUS E PEDIDOS ---
-
 @app.get("/")
 def root():
     return {
@@ -86,6 +117,7 @@ def listar_pedidos():
 
 # --- CÉREBRO (LÓGICA) ---
 def analisar_contexto(texto_novo, estado_atual):
+    # Inicializa com o estado atual ou padrões
     novo_estado = estado_atual.copy() if estado_atual else {}
     defaults = {"produto": None, "plano": None, "whatsapp": None, "endereco": None, "pix_gerado": False}
     for k, v in defaults.items():
@@ -94,6 +126,7 @@ def analisar_contexto(texto_novo, estado_atual):
 
     txt = texto_novo.lower()
 
+    # Detecção de produto
     if "whey" in txt:
         novo_estado["produto"] = "Whey Protein Gold"
     elif "creatina" in txt:
@@ -101,15 +134,18 @@ def analisar_contexto(texto_novo, estado_atual):
     elif "camiseta" in txt:
         novo_estado["produto"] = "Camiseta Mars"
 
+    # Detecção de plano
     if "mensal" in txt or "assinatura" in txt:
         novo_estado["plano"] = "Mensal"
-    elif "unico" in txt or "único" in txt or "avista" in txt:
+    elif "unico" in txt or "único" in txt or "avista" in txt or "à vista" in txt:
         novo_estado["plano"] = "Único"
 
+    # Detecção de WhatsApp (números)
     numeros = ''.join(filter(str.isdigit, txt))
     if len(numeros) >= 10 and len(numeros) <= 11:
         novo_estado["whatsapp"] = numeros
 
+    # Detecção de endereço
     palavras_chave_end = ["rua", "av", "avenida", "bairro", "casa", "apto", "bloco", "entrega", "número", "cep", "logradouro"]
     if len(txt) > 5 and any(p in txt for p in palavras_chave_end):
         novo_estado["endereco"] = texto_novo
@@ -126,9 +162,18 @@ async def chat_endpoint(data: ChatInput):
         db_reset_session(user)
         return {"respostas": ["Beleza! Memória apagada. --- O que você manda hoje, atleta?"], "imagem": None, "pix": None}
 
-    # Carrega estado atual do banco
+    # Carrega estado atual (tenta Supabase, fallback memória)
     sessao_banco = db_get_session(user) or {}
+    print(f"🔍 Estado carregado para {user}: {sessao_banco}")
+
+    # Analisa a mensagem atual e mescla com o estado anterior
     estado_final = analisar_contexto(data.texto, sessao_banco)
+    
+    # Preserva dados que vieram do banco mas não foram sobrescritos
+    for campo in ["produto", "plano", "whatsapp", "endereco", "pix_gerado"]:
+        if campo not in estado_final or estado_final[campo] is None:
+            if campo in sessao_banco and sessao_banco[campo] is not None:
+                estado_final[campo] = sessao_banco[campo]
     
     prod = estado_final.get("produto")
     plan = estado_final.get("plano")
@@ -136,7 +181,7 @@ async def chat_endpoint(data: ChatInput):
     end = estado_final.get("endereco")
     pix_gerado = estado_final.get("pix_gerado", False)
 
-    # LOGS PARA DEPURAÇÃO
+    # LOGS DETALHADOS
     print(f"--- DEBUG ---")
     print(f"Usuário: {user}")
     print(f"Mensagem: {data.texto}")
@@ -149,9 +194,10 @@ async def chat_endpoint(data: ChatInput):
     dados_validos = zap and end and len(str(zap)) > 6 and len(str(end)) > 5
 
     # ========== INTERVENÇÃO MANUAL REFORÇADA ==========
-    # Se o cliente já escolheu um produto, mas ainda não escolheu o plano,
-    # e a mensagem contém "mensal" ou "unico" (ou variações), definimos o plano manualmente.
-    if prod and not plan:
+    # Se o cliente já escolheu um produto (no estado atual ou no anterior), mas ainda não escolheu o plano,
+    # e a mensagem contém "mensal" ou "unico", definimos o plano manualmente.
+    produto_definido = prod is not None or (sessao_banco.get("produto") is not None)
+    if produto_definido and not plan:
         if "mensal" in txt_low or "assinatura" in txt_low:
             print(">>> Intervenção: plano Mensal detectado")
             estado_final["plano"] = "Mensal"
@@ -162,7 +208,7 @@ async def chat_endpoint(data: ChatInput):
                 "imagem": None,
                 "pix": None
             }
-        elif "unico" in txt_low or "único" in txt_low or "avista" in txt_low:
+        elif "unico" in txt_low or "único" in txt_low or "avista" in txt_low or "à vista" in txt_low:
             print(">>> Intervenção: plano Único detectado")
             estado_final["plano"] = "Único"
             plan = "Único"
@@ -203,6 +249,7 @@ async def chat_endpoint(data: ChatInput):
         except Exception as e:
             print("Erro ao gerar PIX:", e)
 
+    # Salva o estado final (no Supabase e/ou memória)
     db_upsert_session(user, estado_final)
 
     # ========== CONSTRUÇÃO DO STATUS_MSG ==========
@@ -217,7 +264,7 @@ async def chat_endpoint(data: ChatInput):
     else:
         status_msg = f"Todos os dados coletados. PIX será gerado."
 
-    # ========== PROMPT (mantido igual, mas agora com status correto) ==========
+    # ========== PROMPT ==========
     prompt = f"""
     Você é a MARS, assistente virtual da loja de suplementos.  
     Cliente: {user}.  
